@@ -1,0 +1,8 @@
+*.o
+*.a
+*.so
+
+v4l2_drm_imx415_cloud_img
+peripheral_probe
+
+*.log
