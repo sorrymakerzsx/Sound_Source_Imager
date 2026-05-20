@@ -7,9 +7,13 @@
 #include <vector>
 
 struct EepromVersionInfo {
+    // 是否成功读取到 EEPROM 信息。
     bool available = false;
+    // 实际读取成功的设备节点路径。
     std::string device_path;
+    // 按可打印字符解释后的版本字符串。
     std::string text;
+    // EEPROM 返回的原始字节流。
     std::vector<uint8_t> raw_bytes;
 };
 

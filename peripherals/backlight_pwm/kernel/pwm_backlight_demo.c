@@ -15,10 +15,15 @@
 #include <linux/slab.h>
 
 struct zsx_pwm_bl {
+    /* 绑定到当前背光设备的 PWM 句柄。 */
     struct pwm_device *pwm;
+    /* Linux backlight 子系统里的背光设备对象。 */
     struct backlight_device *bl_dev;
+    /* 可选的使能 GPIO，用于控制背光电源开关。 */
     struct gpio_desc *enable_gpio;
+    /* 背光支持的最大亮度值。 */
     u32 max_brightness;
+    /* PWM 周期，单位纳秒。 */
     u32 period_ns;
 };
 

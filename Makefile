@@ -9,7 +9,7 @@ CXX = $(CROSS_COMPILE)g++
 SYSROOT = /opt/atk-dlrk3588-toolchain/aarch64-buildroot-linux-gnu/sysroot
 SDK_ROOT = /home/zsx/rk3588_linux_sdk
 CXXFLAGS = -Wall -O2 -std=c++11 -pthread \
-	-I./app -I./config -I./display -I./audio -I./stream -I./autofocus -I./shared -I./assets -I./dw9763_v4l2subdev -I./peripherals/backlight_pwm -I./peripherals/eeprom_version \
+	-I./app -I./config -I./display -I./audio -I./stream -I./autofocus -I./shared -I./assets -I./dw9763_v4l2subdev -I./peripherals/backlight_pwm -I./peripherals/eeprom_version -I./peripherals/key_noblockio \
 	-I$(SYSROOT)/usr/include/libdrm -I$(SYSROOT)/usr/include/drm -I$(SDK_ROOT)/external/mpp/inc
 LDFLAGS = -pthread -ldrm -lrockchip_mpp
 
@@ -25,6 +25,7 @@ SRCS = app/main.cpp \
 	display/drm_mode.cpp \
 	peripherals/backlight_pwm/backlight_pwm.cpp \
 	peripherals/eeprom_version/eeprom_version.cpp \
+	peripherals/key_noblockio/key_select_listener.cpp \
 	dw9763_v4l2subdev/dw9763_vcm_sim.cpp
 OBJS = $(SRCS:.cpp=.o)
 PROBE_SRCS = app/peripheral_probe.cpp peripherals/backlight_pwm/backlight_pwm.cpp peripherals/eeprom_version/eeprom_version.cpp

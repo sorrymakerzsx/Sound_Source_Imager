@@ -11,6 +11,7 @@
 #include "drm_mode.h"
 #include "eeprom_version.h"
 #include "overlay_shared_state.h"
+#include "key_select_listener.h"
 #include "stream_mode.h"
 
 namespace {
@@ -19,14 +20,20 @@ OverlaySharedState *g_overlay_state = nullptr;
 AutofocusSharedState *g_af_state = nullptr;
 
 struct DrmVideoThreadArg {
+    // 指向云图共享状态，供视频线程读取最新 overlay。
     OverlaySharedState *shared_state;
+    // 指向 AF 共享状态，供视频线程发布 ROI、退出时通知 AF。
     AutofocusSharedState *af_state;
+    // 视频线程执行结束后，把返回值写回主线程。
     int *video_result;
 };
 
 struct StreamThreadArg {
+    // 推流模式的运行配置，如 host/port/proto。
     const AppConfig *config;
+    // 指向云图共享状态，供推流线程读取并混合 overlay。
     OverlaySharedState *shared_state;
+    // 推流线程执行结束后，把返回值写回主线程。
     int *stream_result;
 };
 
@@ -85,6 +92,17 @@ void *audio_thread_entry(void *arg) {
 //   固定返回 nullptr。
 void *af_thread_entry(void *arg) {
     run_autofocus_worker(reinterpret_cast<AutofocusSharedState *>(arg));
+    return nullptr;
+}
+
+// 功能：
+//   pthread 按键监听线程入口。
+// 参数：
+//   arg: AutofocusSharedState*。
+// 返回值：
+//   固定返回 nullptr。
+void *key_thread_entry(void *arg) {
+    run_key_select_listener(reinterpret_cast<AutofocusSharedState *>(arg));
     return nullptr;
 }
 
@@ -175,10 +193,11 @@ int main(int argc, char **argv) {
     log_peripheral_state();
 
     if (config.mode == OutputMode::DRM) {
-        // DRM 模式下有三个线程：
+        // DRM 模式下当前有四个线程：
         // 1. 云图线程：生成声源热点 ARGB 图；
         // 2. AF 线程：消费 ROI，做 Sobel + 爬山；
-        // 3. 视频线程：V4L2 取帧并通过 DRM 显示。
+        // 3. 按键线程：select 监听 /dev/key，触发 AF 重新爬山；
+        // 4. 视频线程：V4L2 取帧并通过 DRM 显示。
         OverlaySharedState shared_state;
         AutofocusSharedState af_state;
         if (!init_overlay_shared_state(&shared_state)) {
@@ -197,6 +216,7 @@ int main(int argc, char **argv) {
         int video_result = 0;
         pthread_t audio_thread = 0;
         pthread_t af_thread = 0;
+        pthread_t key_thread = 0;
         pthread_t video_thread = 0;
 
         if (pthread_create(&audio_thread, nullptr, audio_thread_entry, &shared_state) != 0) {
@@ -218,6 +238,22 @@ int main(int argc, char **argv) {
             destroy_overlay_shared_state(&shared_state);
             return -1;
         }
+        if (pthread_create(&key_thread, nullptr, key_thread_entry, &af_state) != 0) {
+            std::cerr << "Failed to create key thread." << std::endl;
+            shared_state.running.store(false);
+            pthread_cond_broadcast(&shared_state.condition);
+            pthread_mutex_lock(&af_state.mutex);
+            af_state.running = false;
+            pthread_mutex_unlock(&af_state.mutex);
+            pthread_cond_broadcast(&af_state.condition);
+            pthread_join(audio_thread, nullptr);
+            pthread_join(af_thread, nullptr);
+            g_overlay_state = nullptr;
+            g_af_state = nullptr;
+            destroy_autofocus_shared_state(&af_state);
+            destroy_overlay_shared_state(&shared_state);
+            return -1;
+        }
 
         DrmVideoThreadArg video_arg = {&shared_state, &af_state, &video_result};
         if (pthread_create(&video_thread, nullptr, drm_video_thread_entry, &video_arg) != 0) {
@@ -230,6 +266,7 @@ int main(int argc, char **argv) {
             pthread_cond_broadcast(&af_state.condition);
             pthread_join(audio_thread, nullptr);
             pthread_join(af_thread, nullptr);
+            pthread_join(key_thread, nullptr);
             g_overlay_state = nullptr;
             g_af_state = nullptr;
             destroy_autofocus_shared_state(&af_state);
@@ -246,6 +283,7 @@ int main(int argc, char **argv) {
         pthread_cond_broadcast(&af_state.condition);
         pthread_join(audio_thread, nullptr);
         pthread_join(af_thread, nullptr);
+        pthread_join(key_thread, nullptr);
         g_overlay_state = nullptr;
         g_af_state = nullptr;
         destroy_autofocus_shared_state(&af_state);

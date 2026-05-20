@@ -4,10 +4,15 @@
 #include <string>
 
 struct BacklightDeviceInfo {
+    // 是否成功探测到可用背光设备。
     bool available = false;
+    // 背光设备名称，对应 /sys/class/backlight/<name>。
     std::string name;
+    // 背光设备在 sysfs 下的根路径。
     std::string base_path;
+    // 当前亮度值。
     int brightness = -1;
+    // 设备支持的最大亮度值。
     int max_brightness = -1;
 };
 

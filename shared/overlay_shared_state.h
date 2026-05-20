@@ -10,7 +10,9 @@
 // 当前实现里，云图线程只负责生成整张 ARGB overlay，
 // 视频线程再把最新一版 overlay 拷到 DRM overlay buffer 上。
 struct OverlaySharedState {
+    // 保护 pixels/width/height/generation/ready 这些共享字段的互斥锁。
     pthread_mutex_t mutex;
+    // 用于“尺寸已准备好”等事件通知的条件变量。
     pthread_cond_t condition;
     // 整张 ARGB overlay 的 CPU 像素数据。
     std::vector<uint32_t> pixels;
@@ -21,6 +23,7 @@ struct OverlaySharedState {
     uint64_t generation = 0;
     // ready 表示 DRM 线程已经把 overlay 尺寸准备好了，云图线程可以开始出图。
     bool ready = false;
+    // 线程总运行标志，主线程退出时会把它清为 false。
     std::atomic<bool> running{true};
     // 视频 plane 如果被设置了 270 度旋转，云图也要跟着同样的显示方向做坐标映射。
     std::atomic<bool> rotate_270{false};

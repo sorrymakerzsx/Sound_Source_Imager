@@ -14,14 +14,21 @@
 #define EEPROM_CNT 1
 
 struct eeprom_dev {
+    /* 字符设备号，对应 /dev/eeprom_ver。 */
     dev_t devid;
+    /* 字符设备对象，绑定 open/read/write 等文件操作。 */
     struct cdev cdev;
+    /* 设备类，供 sysfs 和 device_create 使用。 */
     struct class *class;
+    /* 创建设备节点后的 device 对象。 */
     struct device *device;
+    /* 当前 EEPROM 所在的 I2C 设备句柄。 */
     struct i2c_client *client;
+    /* 主设备号缓存，便于静态注册或复用。 */
     int major;
 };
 
+/* 全局 EEPROM 设备实例，驱动所有文件操作都依赖它。 */
 static struct eeprom_dev eeprom_device;
 
 static int eeprom_write_regs(struct eeprom_dev *dev, u8 reg, u8 *buf, int len)

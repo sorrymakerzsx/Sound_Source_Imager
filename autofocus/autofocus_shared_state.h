@@ -14,22 +14,39 @@ static const int kAfLogicalMax = 64;
 // 只共享一块中心 ROI 的 Y 分量，而不是整帧 NV12，
 // 这样拷贝量小，且 AF 线程可以只针对 Sobel 所需的数据工作。
 struct AutofocusSharedState {
+    // 保护 roi_y/new_frame/restart_requested/running 等共享字段的互斥锁。
     pthread_mutex_t mutex;
+    // 视频线程发布新 ROI 后，用它唤醒 AF 线程。
     pthread_cond_t condition;
     // 共享 ROI，仅保存亮度分量，适合清晰度评价。
     std::array<uint8_t, kAfRoiWidth * kAfRoiHeight> roi_y{};
     // new_frame = 1 表示视频线程刚发布了一块新 ROI；
     // AF 线程复制走 ROI 后会把它清 0。
     bool new_frame = false;
+    // restart_requested = 1 表示按键线程请求 AF 线程丢弃旧的爬山历史，
+    // 以当前镜头位置为起点，重新用初始步长开始搜索。
+    bool restart_requested = false;
+    // AF 线程总运行标志，程序退出时置 false。
     bool running = true;
+    // 视频线程累计成功发布给 AF 的 ROI 帧数。
     uint64_t published_frames = 0;
     // 下面这些值主要用于观察 AF 搜索状态。
+    // 当前准备写入或刚写入的逻辑焦点位置。
     std::atomic<int> current_focus{32};
+    // 搜索过程中记录到的最优焦点位置。
     std::atomic<int> best_focus{32};
+    // 当前爬山搜索步长。
     std::atomic<int> current_step{0};
+    // 最近一帧 ROI 的 Sobel 清晰度分数。
     std::atomic<int> last_sharpness{0};
+    // 历史最优清晰度分数。
     std::atomic<int> best_sharpness{0};
+    // 最近一次镜头移动耗时，单位微秒。
     std::atomic<int> last_move_us{0};
+    // 当前已经连续多少帧出现清晰度下降。
+    std::atomic<int> decline_streak{0};
+    // 本轮运行中 AF 被重置重新爬山的次数。
+    std::atomic<int> restart_count{0};
 };
 
 // 功能：

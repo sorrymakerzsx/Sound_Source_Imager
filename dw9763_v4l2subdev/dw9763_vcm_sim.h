@@ -4,11 +4,17 @@
 #include <cstdint>
 
 struct Dw9763SimConfig {
+    // 模拟 VCM 的最大电流上限。
     uint32_t max_current = 120;
+    // 镜头开始可运动时的起始电流。
     uint32_t start_current = 20;
+    // 镜头额定电流，对应整个有效行程的上边界。
     uint32_t rated_current = 90;
+    // 模拟步进模式参数。
     uint32_t step_mode = 3;
+    // 模拟 VCM 的源时间寄存器参数。
     uint32_t t_src = 0x20;
+    // 模拟 VCM 的时间分频参数。
     uint32_t t_div = 1;
 };
 
@@ -47,9 +53,13 @@ public:
     unsigned int get_lens_reg() const;
 
 private:
+    // 模拟器当前使用的配置参数集合。
     Dw9763SimConfig config_;
+    // 当前逻辑焦点位置 [0,64] 对应的内部位置值。
     unsigned int current_related_pos_;
+    // 当前换算后的镜头寄存器/电流位置。
     unsigned int current_lens_pos_;
+    // 由配置推导出的单步电流增量。
     unsigned int step_;
 };
 

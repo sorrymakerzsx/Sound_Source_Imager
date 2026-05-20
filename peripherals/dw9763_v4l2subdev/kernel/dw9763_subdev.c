@@ -25,7 +25,9 @@
  *   这是数据结构体，本身没有返回值。
  */
 struct rk_cam_vcm_tim {
+    /* 最近一次镜头移动耗时，单位微秒。 */
     unsigned int move_us;
+    /* 预留字段，供后续 RK 私有扩展使用。 */
     unsigned int reserved;
 };
 
@@ -42,16 +44,27 @@ struct rk_cam_vcm_tim {
  *   这是数据结构体，本身没有返回值。
  */
 struct dw9763_device {
+    /* V4L2 子设备对象，负责把本驱动注册进媒体拓扑。 */
     struct v4l2_subdev sd;
+    /* V4L2 控件管理器，用于挂接 focus 控件。 */
     struct v4l2_ctrl_handler ctrls;
+    /* 当前 DW9763 所在的 I2C 设备句柄。 */
     struct i2c_client *client;
+    /* 保护位置状态和 I2C 动作的互斥锁。 */
     struct mutex lock;
+    /* 逻辑焦点映射到 VCM 电流时的起始电流。 */
     unsigned int start_current;
+    /* 逻辑焦点映射到 VCM 电流时的额定电流上限。 */
     unsigned int rated_current;
+    /* 驱动从设备树读取的步进模式配置。 */
     unsigned int step_mode;
+    /* 每增加 1 个逻辑焦点单位时，电流应增加多少。 */
     unsigned int step;
+    /* 当前已经写入芯片的物理镜头寄存器位置。 */
     unsigned int current_lens_pos;
+    /* 当前缓存的逻辑焦点位置，范围通常为 [0,64]。 */
     unsigned int current_related_pos;
+    /* 最近一次镜头移动耗时，供 RK 私有 ioctl 返回给上层。 */
     unsigned int last_move_us;
 };
 

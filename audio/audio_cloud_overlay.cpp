@@ -17,30 +17,43 @@ namespace {
 static const float kPi = 3.14159265358979323846f;
 
 struct Vec2 {
+    // 阵列平面内的横向坐标。
     float x;
+    // 阵列平面内的纵向坐标。
     float y;
 };
 
 struct Vec3 {
+    // 三维空间的 X 轴分量。
     float x;
+    // 三维空间的 Y 轴分量。
     float y;
+    // 三维空间的 Z 轴分量。
     float z;
 };
 
 struct Source {
+    // 归一化图像横坐标，用于表示声源在画面中的水平位置。
     float u;
+    // 归一化图像纵坐标，用于表示声源在画面中的垂直位置。
     float v;
+    // 声源幅度，用于决定模拟观测信号强弱。
     float amplitude;
 };
 
 struct Peak {
+    // 峰值在功率图或显示图中的横坐标。
     int x;
+    // 峰值在功率图或显示图中的纵坐标。
     int y;
+    // 峰值功率强度。
     float power;
 };
 
 struct PixelCoord {
+    // 显示像素横坐标。
     int x;
+    // 显示像素纵坐标。
     int y;
 };
 

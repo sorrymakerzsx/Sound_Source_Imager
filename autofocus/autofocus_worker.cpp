@@ -17,26 +17,48 @@
 
 namespace {
 
+static const int kAfInitialStep = 8;
+static const int kAfDeclineRestartThreshold = 3;
+
 struct rk_cam_vcm_tim {
+    // 驱动返回给应用层的本次马达移动耗时，单位微秒。
     unsigned int move_us;
+    // 预留字段，方便后续扩展其他时间信息。
     unsigned int reserved;
 };
 
 #define RK_VIDIOC_VCM_TIMEINFO _IOR('V', BASE_VIDIOC_PRIVATE + 0, struct rk_cam_vcm_tim)
 
 struct FocusControlContext {
+    // 已打开的真实 focus 控制设备 fd；找不到时为 -1。
     int fd = -1;
+    // 当前选中的设备节点路径，便于日志打印。
     std::string path;
+    // 是否成功找到了支持 V4L2_CID_FOCUS_ABSOLUTE 的真实设备。
     bool use_ioctl = false;
 };
 
 struct HillClimbState {
+    // 当前焦点位置，也是本次 sharpness 对应的位置。
     int current_pos = 32;
-    int step = 8;
+    // 当前爬山步长；越小表示已进入精细搜索阶段。
+    int step = kAfInitialStep;
+    // 搜索方向，1 表示朝增大方向，-1 表示朝减小方向。
     int direction = 1;
+    // 历史上取得最佳清晰度时对应的焦点位置。
     int best_pos = 32;
+    // 历史最佳清晰度值。
     int best_sharpness = 0;
+    // 是否已经有有效的 best_pos/best_sharpness 记录。
     bool has_best = false;
+    // 连续多少帧出现了 sharpness 下降，用于触发重新爬山。
+    int decline_streak = 0;
+    // 上一帧的清晰度值，用于判断本帧是否变差。
+    int last_sharpness = 0;
+    // 上一帧清晰度是否有效。
+    bool has_last_sharpness = false;
+    // 已经执行过多少次“重置步长重新爬山”。
+    int restart_count = 0;
 };
 
 // 功能：
@@ -195,6 +217,55 @@ static bool apply_focus_position(FocusControlContext *focus_ctx,
 }
 
 // 功能：
+//   丢弃旧的爬山历史，以当前镜头位置为锚点重新开始搜索。
+// 参数：
+//   hill: 待重置的爬山状态。
+//   anchor_pos: 重新开始搜索时的镜头位置。
+// 返回值：
+//   无返回值。
+static void reset_hill_climb_state(HillClimbState *hill, int anchor_pos) {
+    if (!hill) {
+        return;
+    }
+
+    anchor_pos = std::max(0, std::min(kAfLogicalMax, anchor_pos));
+    hill->restart_count++;
+    hill->current_pos = anchor_pos;
+    hill->step = kAfInitialStep;
+    hill->direction = (hill->restart_count % 2 == 0) ? 1 : -1;
+    hill->best_pos = anchor_pos;
+    hill->best_sharpness = 0;
+    hill->has_best = false;
+    hill->decline_streak = 0;
+    hill->last_sharpness = 0;
+    hill->has_last_sharpness = false;
+}
+
+// 功能：
+//   根据相邻两帧的 Sobel 清晰度变化，统计“连续变差”的帧数。
+// 参数：
+//   hill: 爬山状态机，内部会记录上一帧清晰度和连续变差计数。
+//   sharpness: 当前帧清晰度。
+// 返回值：
+//   true  表示已经连续多帧变差，建议重置步长重新爬山；
+//   false 表示还不需要重启搜索。
+static bool update_decline_streak(HillClimbState *hill, int sharpness) {
+    if (!hill) {
+        return false;
+    }
+
+    if (hill->has_last_sharpness && sharpness < hill->last_sharpness) {
+        hill->decline_streak++;
+    } else {
+        hill->decline_streak = 0;
+    }
+
+    hill->last_sharpness = sharpness;
+    hill->has_last_sharpness = true;
+    return hill->decline_streak >= kAfDeclineRestartThreshold;
+}
+
+// 功能：
 //   根据当前清晰度结果执行一步爬山搜索，输出下一次要尝试的焦点位置。
 // 参数：
 //   hill: 爬山状态机，包括当前位置、方向、步长和历史最优点。
@@ -247,6 +318,8 @@ void run_autofocus_worker(AutofocusSharedState *state) {
 
     state->current_step.store(hill.step);
     state->best_focus.store(hill.best_pos);
+    state->decline_streak.store(0);
+    state->restart_count.store(0);
 
     if (focus_ctx.use_ioctl) {
         std::cout << "[af] using focus ioctl device: " << focus_ctx.path << std::endl;
@@ -259,6 +332,7 @@ void run_autofocus_worker(AutofocusSharedState *state) {
     state->last_move_us.store(initial_move_us);
 
     while (true) {
+        bool restart_requested = false;
         {
             pthread_mutex_lock(&state->mutex);
             while (state->running && !state->new_frame) {
@@ -269,18 +343,41 @@ void run_autofocus_worker(AutofocusSharedState *state) {
                 break;
             }
             std::copy(state->roi_y.begin(), state->roi_y.end(), local_roi.begin());
+            restart_requested = state->restart_requested;
+            state->restart_requested = false;
             state->new_frame = false;
             pthread_mutex_unlock(&state->mutex);
         }
 
         int sharpness = compute_sobel_sharpness(local_roi);
         state->last_sharpness.store(sharpness);
-        state->best_sharpness.store(hill.best_sharpness);
+
+        bool decline_restart = false;
+        if (!restart_requested) {
+            decline_restart = update_decline_streak(&hill, sharpness);
+        }
+
+        if (restart_requested || decline_restart) {
+            const int restart_anchor = state->current_focus.load();
+            reset_hill_climb_state(&hill, restart_anchor);
+            hill.last_sharpness = sharpness;
+            hill.has_last_sharpness = true;
+
+            std::cout << "[af] restart hill climb: reason="
+                      << (restart_requested ? "key" : "sharpness-decline")
+                      << " anchor=" << restart_anchor
+                      << " sharpness=" << sharpness
+                      << " reset_count=" << hill.restart_count
+                      << std::endl;
+        }
 
         int next_pos = update_hill_climb_state(&hill, sharpness);
         state->best_focus.store(hill.best_pos);
         state->current_step.store(hill.step);
         state->current_focus.store(next_pos);
+        state->best_sharpness.store(hill.best_sharpness);
+        state->decline_streak.store(hill.decline_streak);
+        state->restart_count.store(hill.restart_count);
 
         int move_time_us = 30000;
         apply_focus_position(&focus_ctx, &vcm, next_pos, &move_time_us);
