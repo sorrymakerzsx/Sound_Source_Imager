@@ -12,7 +12,6 @@
 #include <sys/mman.h>
 #include <sys/time.h>
 #include <unistd.h>
-#include <pthread.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
@@ -20,19 +19,9 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
-#include <string>
 #include <vector>
 
-// 功能：
-//   根据属性名字从 DRM 对象属性表中查找对应的 property id。
-// 参数：
-//   fd: DRM 设备文件描述符。
-//   props: 通过 drmModeObjectGetProperties 得到的属性表。
-//   name: 目标属性名称，如 "rotation"、"zpos"、"alpha"。
-// 返回值：
-//   找到则返回 property id，找不到返回 0。
-// 说明：
-//   在 DRM 里，rotation / zpos / alpha / pixel blend mode 等能力都通过 property 暴露。
+// 按名字查找 DRM property id（用于 rotation / zpos / alpha 等属性）。
 static uint32_t get_property_id(int fd, drmModeObjectProperties *props, const char *name) {
     uint32_t id = 0;
     for (uint32_t i = 0; i < props->count_props; i++) {
@@ -50,16 +39,7 @@ static uint32_t get_property_id(int fd, drmModeObjectProperties *props, const ch
     return id;
 }
 
-// 功能：
-//   按属性名称读取 DRM 对象当前的属性值。
-// 参数：
-//   fd: DRM 设备文件描述符。
-//   props: 属性表。
-//   name: 目标属性名称。
-// 返回值：
-//   找到则返回该属性当前值，找不到返回 0。
-// 说明：
-//   这里主要用于读取 plane 的 type，从而区分 Primary 和 Overlay。
+// 按名字读取 DRM 对象属性值，主要用于读 plane type（区分 Primary / Overlay）。
 static uint64_t get_property_value(int fd, drmModeObjectProperties *props, const char *name) {
     for (uint32_t i = 0; i < props->count_props; i++) {
         drmModePropertyRes *prop = drmModeGetProperty(fd, props->props[i]);
@@ -74,15 +54,7 @@ static uint64_t get_property_value(int fd, drmModeObjectProperties *props, const
     return 0;
 }
 
-// 功能：
-//   检查某个 DRM plane 是否支持指定像素格式。
-// 参数：
-//   plane: 待检查的 DRM plane。
-//   format: DRM_FORMAT_* 定义的像素格式。
-// 返回值：
-//   true 表示支持；false 表示不支持。
-// 说明：
-//   本工程会用它分别筛选 NV12 视频 plane 和 ARGB8888 overlay plane。
+// 检查 plane 是否支持指定格式（NV12 / ARGB8888）。
 static bool plane_supports_format(drmModePlane *plane, uint32_t format) {
     for (uint32_t j = 0; j < plane->count_formats; j++) {
         if (plane->formats[j] == format) {
@@ -92,17 +64,7 @@ static bool plane_supports_format(drmModePlane *plane, uint32_t format) {
     return false;
 }
 
-// 功能：
-//   把云图线程生成好的 ARGB 像素复制到真正用于显示的 dumb buffer。
-// 参数：
-//   dst: 最终要给 DRM overlay plane 使用的 dumb buffer。
-//   width/height: 目标有效区域大小。
-//   src_pixels: 云图线程生成的 ARGB 像素数组。
-//   src_width/src_height: 源 overlay 尺寸。
-// 返回值：
-//   无返回值；若源尺寸与目标尺寸不一致，只会先清空目标图像然后直接返回。
-// 说明：
-//   当前实现里，云图线程只算图，不直接提交 DRM；视频线程在显示循环中消费最新结果。
+// 把云图 ARGB 像素拷贝到 DRM dumb buffer 上屏。
 static void copy_overlay_frame(DumbBuffer *dst,
                                int width,
                                int height,
@@ -123,17 +85,9 @@ static void copy_overlay_frame(DumbBuffer *dst,
     }
 }
 
-// 功能：
-//   从当前 NV12 帧中复制中心 ROI 的 Y 分量，并发布给 AF 线程。
-// 参数：
-//   af_state: AF 共享状态；若为空则不发布。
-//   buffer: 当前视频帧的 CPU 可访问缓冲区。
-//   pitch: NV12 图像一行的字节跨度。
-// 返回值：
-//   无返回值。
-// 说明：
-//   这里使用 try_lock，如果 AF 线程正持锁处理上一帧，视频线程会跳过本帧 ROI 发布，
-//   以保证显示链路不因 AF 而卡顿。
+// 从 NV12 帧中心抠 320×240 Y 给 AF 线程。
+// 写入 roi_y[1 - write_idx] 这个非活跃槽，写完翻转 write_idx + 置 new_frame。
+// AF 线程跟视频线程永远不会踩同一个 roi_y 槽，所以不用锁。
 static void publish_af_roi_if_possible(AutofocusSharedState *af_state,
                                        const Buffer &buffer,
                                        uint32_t pitch) {
@@ -141,41 +95,27 @@ static void publish_af_roi_if_possible(AutofocusSharedState *af_state,
         return;
     }
 
-    if (pthread_mutex_trylock(&af_state->mutex) != 0) {
-        return;
-    }
-
+    const int next = 1 - __atomic_load_n(&af_state->write_idx, __ATOMIC_ACQUIRE);
     const uint8_t *src_y = reinterpret_cast<const uint8_t *>(buffer.start);
     const int roi_x = static_cast<int>((kFrameWidth - kAfRoiWidth) / 2);
-    const int roi_y = static_cast<int>((kFrameHeight - kAfRoiHeight) / 2);
+    const int roi_y_off = static_cast<int>((kFrameHeight - kAfRoiHeight) / 2);
     for (int y = 0; y < kAfRoiHeight; ++y) {
-        std::memcpy(&af_state->roi_y[y * kAfRoiWidth],
-                    src_y + (roi_y + y) * pitch + roi_x,
+        std::memcpy(&af_state->roi_y[next][y * kAfRoiWidth],
+                    src_y + (roi_y_off + y) * pitch + roi_x,
                     kAfRoiWidth);
     }
-    af_state->new_frame = true;
-    af_state->published_frames++;
-    pthread_mutex_unlock(&af_state->mutex);
-    pthread_cond_signal(&af_state->condition);
+    __atomic_store_n(&af_state->write_idx, next, __ATOMIC_RELEASE);
+    __atomic_store_n(&af_state->new_frame, true, __ATOMIC_RELEASE);
+    __atomic_fetch_add(&af_state->published_frames, 1, __ATOMIC_RELAXED);
 }
 
-// 功能：
-//   DRM 模式的视频显示主线程。
-//   完整流程包括：V4L2 采集、DRM 资源枚举、双 plane 显示、云图 overlay 消费、AF ROI 发布。
-// 参数：
-//   state: 云图共享状态；若非空，则从中读取最新 overlay 叠加到 ARGB overlay plane。
-//   af_state: AF 共享状态；若非空，则每帧发布中心 ROI 给 AF 线程。
-// 返回值：
-//   0  表示主循环正常结束；
-//   -1 表示初始化或运行过程中出现错误。
+// DRM 模式主线程：V4L2 采集 → DRM 双 plane 显示（视频层 + 云图叠加层），
+// 同时逐帧给 AF 线程喂中心 ROI。
 int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af_state) {
     std::cout << "Selected mode: drm" << std::endl;
     std::cout << "Starting V4L2 + DRM Zero-Copy Display for IMX415..." << std::endl;
 
-    // 第一步：初始化 V4L2 采集端，输出 NV12。
-    // 这里的 NV12 将被同时用于：
-    // 1. 直接导入 DRM 做本地显示；
-    // 2. 提取中心 ROI 给 AF 线程。
+    // ---- V4L2 采集初始化 ----
     int v4l2_fd = open(kV4L2Device, O_RDWR | O_NONBLOCK, 0);
     if (v4l2_fd < 0) {
         std::cerr << "Failed to open " << kV4L2Device << std::endl;
@@ -201,8 +141,7 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
         af_pitch = kFrameWidth;
     }
 
-    // 第二步：初始化 DRM/KMS。
-    // DRM 负责“找到显示器 -> 找到扫描输出路径 -> 找到可显示图层 plane”。
+    // ---- DRM/KMS 初始化 ----
     int drm_fd = open(kDrmDevice, O_RDWR | O_CLOEXEC);
     if (drm_fd < 0) {
         std::cerr << "Failed to open " << kDrmDevice << std::endl;
@@ -217,9 +156,7 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
         std::cerr << "Failed to enable universal planes" << std::endl;
     }
 
-    // DRM 资源树大致是：
-    // connector -> encoder -> crtc -> plane
-    // connector 对应外部显示接口，crtc 可理解为扫描输出控制器，plane 是可叠加图层。
+    // DRM 拓扑：connector → encoder → crtc → plane
     drmModeRes *res = drmModeGetResources(drm_fd);
     if (!res) {
         std::cerr << "Failed to get DRM resources" << std::endl;
@@ -267,14 +204,13 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
         }
     }
 
-    // 第三步：从所有 plane 里挑两个我们能用的图层。
-    // - plane_id：主视频层，要求支持 NV12
-    // - text_plane_id：叠加层，要求支持 ARGB8888，优先选 Overlay 类型
+    // ---- 挑选 plane：NV12 视频层 + ARGB 叠加层 ----
     drmModePlaneRes *plane_res = drmModeGetPlaneResources(drm_fd);
     uint32_t plane_id = 0;
     uint32_t text_plane_id = 0;
 
     if (plane_res) {
+        // 先找关联当前 crtc 且支持 NV12 的 plane
         for (uint32_t i = 0; i < plane_res->count_planes; i++) {
             drmModePlane *plane = drmModeGetPlane(drm_fd, plane_res->planes[i]);
             if (plane && plane->crtc_id == crtc_id && plane_supports_format(plane, DRM_FORMAT_NV12)) {
@@ -302,6 +238,7 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
             }
         }
 
+        // 再找支持 ARGB8888 的 overlay 层（优先 Overlay 类型）
         for (uint32_t i = 0; i < plane_res->count_planes; i++) {
             drmModePlane *plane = drmModeGetPlane(drm_fd, plane_res->planes[i]);
             if (plane && plane->plane_id != plane_id && (plane->possible_crtcs & (1 << crtc_index))) {
@@ -327,6 +264,7 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
             }
         }
 
+        // 没 Overlay 类型就随便挑一个支持 ARGB 的
         if (text_plane_id == 0) {
             for (uint32_t i = 0; i < plane_res->count_planes; i++) {
                 drmModePlane *plane = drmModeGetPlane(drm_fd, plane_res->planes[i]);
@@ -361,8 +299,7 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
         std::cout << "Using Overlay Plane " << text_plane_id << std::endl;
     }
 
-    // 第四步：为 overlay plane 创建一个 CPU 可写的 ARGB8888 dumb buffer。
-    // dumb buffer 的优点是：创建简单、能 mmap，适合画文字/热点图。
+    // ---- overlay plane: 创建 CPU 可写的 ARGB dumb buffer ----
     DumbBuffer text_buf;
     const int text_w = mode.hdisplay;
     const int text_h = mode.vdisplay;
@@ -377,7 +314,6 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
             text_buf.pitch = create_arg.pitch;
             text_buf.size = create_arg.size;
 
-            // 把 dumb buffer 注册成 framebuffer 后，plane 才能真正拿它去显示。
             if (drmModeAddFB(drm_fd, text_w, text_h, 24, 32, text_buf.pitch, text_buf.handle,
                              &text_buf.fb_id) == 0) {
                 struct drm_mode_map_dumb map_arg = {0};
@@ -387,20 +323,11 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
                         mmap(0, text_buf.size, PROT_READ | PROT_WRITE, MAP_SHARED, drm_fd, map_arg.offset));
                     if (text_buf.pixels != MAP_FAILED) {
                         clear_argb(&text_buf, text_w, text_h, 0x00000000);
-                        // 把 overlay 尺寸告诉云图线程。
-                        // 云图线程等到 ready 后，才开始按 LCD 实际尺寸生成热点图。
-                        // ===== 与云图线程交互起点（初始化阶段）=====
-                        // 这里把 overlay 的显示尺寸与 ready 状态发布到 OverlaySharedState，
-                        // 用于唤醒 run_audio_overlay_worker() 的启动等待。
+                        // 告诉云图线程尺寸已到位，可以开始画图了
                         if (state) {
-                            pthread_mutex_lock(&state->mutex);
                             state->width = text_w;
                             state->height = text_h;
-                            state->ready = true;
-                            pthread_mutex_unlock(&state->mutex);
-                        }
-                        if (state) {
-                            pthread_cond_broadcast(&state->condition);
+                            __atomic_store_n(&state->ready, true, __ATOMIC_RELEASE);
                         }
                         std::cout << "Created Dumb Buffer FB for sound source overlay on Plane "
                                   << text_plane_id << std::endl;
@@ -414,8 +341,7 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
         std::cerr << "No secondary ARGB plane found for FPS overlay!" << std::endl;
     }
 
-    // 第五步：申请 V4L2 采集缓冲区。
-    // 本工程选择 MMAP，这样既能让 CPU 访问 ROI，也能继续导出 DMA-BUF 给 DRM。
+    // ---- V4L2 缓冲区申请（MMAP）----
     struct v4l2_requestbuffers req;
     std::memset(&req, 0, sizeof(req));
     req.count = kBufferCount;
@@ -453,8 +379,7 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
             return -1;
         }
 
-        // 为 AF 线程额外 mmap 一份 CPU 可访问地址。
-        // 这一步不影响后面 DMA-BUF 零拷贝显示，只是给应用层多一个读 ROI 的入口。
+        // CPU 侧 mmap，供 AF ROI 读取
         buffers[i].length = buf.m.planes[0].length;
         buffers[i].start = mmap(NULL, buffers[i].length, PROT_READ | PROT_WRITE,
                                 MAP_SHARED, v4l2_fd, buf.m.planes[0].m.mem_offset);
@@ -469,8 +394,7 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
             return -1;
         }
 
-        // 关键步骤：把 V4L2 buffer 导出成 DMA-BUF fd。
-        // 这样这个 NV12 帧就可以跨子系统共享给 DRM，不用 CPU 再拷一遍整帧。
+        // 导出 DMA-BUF，供 DRM 零拷贝显示
         struct v4l2_exportbuffer expbuf;
         std::memset(&expbuf, 0, sizeof(expbuf));
         expbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -488,8 +412,7 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
         }
         buffers[i].v4l2_fd = expbuf.fd;
 
-        // DRM 侧把 DMA-BUF fd 导入成 GEM handle。
-        // 之后再用 drmModeAddFB2 把它注册为一个真正的 DRM framebuffer。
+        // 导入 DRM → GEM handle → framebuffer（NV12 双平面）
         if (drmPrimeFDToHandle(drm_fd, buffers[i].v4l2_fd, &buffers[i].drm_handle) < 0) {
             std::cerr << "Failed to import DMA-BUF to DRM" << std::endl;
             drmModeFreeEncoder(enc);
@@ -503,9 +426,6 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
         uint32_t handles[4] = {buffers[i].drm_handle, buffers[i].drm_handle, 0, 0};
         uint32_t pitches[4] = {af_pitch, af_pitch, 0, 0};
         uint32_t offsets[4] = {0, af_pitch * kFrameHeight, 0, 0};
-        // NV12 是双平面格式：
-        // plane0 是 Y，plane1 是 UV。
-        // 这里通过 handles/pitches/offsets 把同一个 DMA-BUF 描述成 NV12 framebuffer。
         if (drmModeAddFB2(drm_fd, kFrameWidth, kFrameHeight, DRM_FORMAT_NV12,
                           handles, pitches, offsets, &buffers[i].drm_fb_id, 0) < 0) {
             std::cerr << "Failed to add DRM FB" << std::endl;
@@ -547,17 +467,10 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
     bool first_frame = true;
 
     uint64_t applied_overlay_generation = 0;
-    std::string fps_text = "FPS: --.-";
+    char fps_text[32] = "FPS: --.-";
 
-    // 第六步：进入显示主循环。
-    // 每轮做的事是：
-    // 1. 等待 V4L2 出一帧；
-    // 2. DQBUF 取出这一帧；
-    // 3. 发布中心 ROI 给 AF 线程；
-    // 4. 把该帧对应的 DRM framebuffer 切到视频 plane；
-    // 5. 如果云图线程生成了新 overlay，就同步刷新 overlay plane 的像素内容；
-    // 6. QBUF 把采集缓冲还回驱动。
-    while (!state || state->running.load()) {
+    // ---- 显示主循环 ----
+    while (!state || __atomic_load_n(&state->running, __ATOMIC_SEQ_CST)) {
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(v4l2_fd, &fds);
@@ -582,9 +495,7 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
             break;
         }
 
-        // ===== 与 AF 线程交互起点（逐帧阶段）=====
-        // ROI 发布在 DQBUF 之后、QBUF 之前完成，
-        // 这样 AF 线程看到的一定是当前这张有效帧的中心区域。
+        // 把中心 ROI 发给 AF 线程
         publish_af_roi_if_possible(af_state, buffers[buf.index], af_pitch);
 
         uint32_t dst_w = mode.hdisplay;
@@ -593,11 +504,7 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
         uint32_t dst_y = 0;
 
         if (first_frame) {
-            // 首帧时做一次比较完整的 plane 初始化：
-            // - rotation
-            // - zpos
-            // - overlay alpha/blend mode
-            // 后续帧只需要不断切 video plane 的 framebuffer 即可。
+            // 首帧做完整 plane 属性配置：rotation / zpos / alpha / blend mode
             drmModeObjectProperties *props =
                 drmModeObjectGetProperties(drm_fd, plane_id, DRM_MODE_OBJECT_PLANE);
             if (props) {
@@ -606,7 +513,7 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
                     if (drmModeObjectSetProperty(drm_fd, plane_id, DRM_MODE_OBJECT_PLANE,
                                                  rot_prop_id, 1 << 3) == 0) {
                         if (state) {
-                            state->rotate_270.store(true);
+                            __atomic_store_n(&state->rotate_270, true, __ATOMIC_SEQ_CST);
                         }
                         std::cout << "Successfully set plane rotation to 270 degrees (Counter-Clockwise 90)."
                                   << std::endl;
@@ -617,14 +524,14 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
                 drmModeFreeObjectProperties(props);
             }
 
-            // 第一次把 NV12 帧挂到视频 plane 上。
-            // 这里 src 用 16.16 定点表示源裁剪矩形，dst 是 LCD 上的目标矩形。
+            // 视频 plane 挂 NV12 framebuffer
             if (drmModeSetPlane(drm_fd, plane_id, crtc_id, buffers[buf.index].drm_fb_id, 0,
                                 dst_x, dst_y, dst_w, dst_h,
                                 0 << 16, 0 << 16, kFrameWidth << 16, kFrameHeight << 16) < 0) {
                 std::cerr << "Failed to set DRM plane." << std::endl;
             }
 
+            // 视频层 zpos = 1
             drmModeObjectProperties *v_props =
                 drmModeObjectGetProperties(drm_fd, plane_id, DRM_MODE_OBJECT_PLANE);
             if (v_props) {
@@ -638,6 +545,7 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
                 drmModeFreeObjectProperties(v_props);
             }
 
+            // 叠加层 zpos = 2, alpha = 100%, blend = premultiplied
             if (text_plane_id && text_buf.pixels) {
                 uint32_t text_dst_x = 0;
                 uint32_t text_dst_y = 0;
@@ -666,8 +574,6 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
                     drmModeFreeObjectProperties(t_props);
                 }
 
-                // 再把 ARGB overlay framebuffer 挂到第二层 plane 上。
-                // 视频层 zpos=1，overlay 层 zpos=2，因此能叠在视频上面。
                 if (drmModeSetPlane(drm_fd, text_plane_id, crtc_id, text_buf.fb_id, 0,
                                     text_dst_x, text_dst_y, text_w, text_h,
                                     0 << 16, 0 << 16, text_w << 16, text_h << 16) < 0) {
@@ -677,13 +583,14 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
 
             first_frame = false;
         } else {
-            // 后续帧只切换视频 plane 指向的 framebuffer，就能完成流畅显示。
+            // 后续帧只切视频 plane 的 framebuffer
             drmModeSetPlane(drm_fd, plane_id, crtc_id, buffers[buf.index].drm_fb_id, 0,
                             dst_x, dst_y, dst_w, dst_h,
                             0 << 16, 0 << 16, kFrameWidth << 16, kFrameHeight << 16);
             usleep(10000);
         }
 
+        // FPS 统计
         frame_count++;
         gettimeofday(&current_time, NULL);
         double elapsed = (current_time.tv_sec - last_time.tv_sec) +
@@ -691,42 +598,27 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
 
         if (elapsed >= 1.0) {
             float fps = frame_count / elapsed;
-            char fps_str[32];
-            std::snprintf(fps_str, sizeof(fps_str), "FPS: %.1f", fps);
-            fps_text = fps_str;
+            snprintf(fps_text, sizeof(fps_text), "FPS: %.1f", fps);
             frame_count = 0;
             last_time = current_time;
         }
 
-        // overlay 的“显示提交”目前仍由视频线程完成：
-        // 视频线程读取云图线程生成的最新 ARGB 像素，再写进 text_buf。
-        // 所以当前实现是“云图计算独立，但上屏提交通路还依附于视频线程”。
-        // ===== 与云图线程交互起点（逐帧阶段）=====
-        // 视频线程在显示循环里尝试读取 OverlaySharedState 的最新 generation/pixels，
-        // 若有新图则更新 text_buf（overlay plane 的内容）。
+        // 无锁读取云图线程发布的最新 overlay ——
+        // generation 变过说明有新图，从 pixels[write_idx]（活跃槽）拷贝，
+        // 音频线程同时写的是 pixels[1 - write_idx]，不冲突。
         if (text_buf.pixels && state) {
-            std::vector<uint32_t> overlay_pixels;
-            int overlay_width = 0;
-            int overlay_height = 0;
-            uint64_t overlay_generation = 0;
-            {
-                if (pthread_mutex_trylock(&state->mutex) == 0) {
-                    overlay_generation = state->generation;
-                    if (overlay_generation != applied_overlay_generation && !state->pixels.empty()) {
-                        overlay_pixels = state->pixels;
-                        overlay_width = state->width;
-                        overlay_height = state->height;
-                    }
-                    pthread_mutex_unlock(&state->mutex);
+            uint64_t overlay_generation = __atomic_load_n(&state->generation, __ATOMIC_ACQUIRE);
+            if (overlay_generation != applied_overlay_generation) {
+                int idx = __atomic_load_n(&state->write_idx, __ATOMIC_ACQUIRE);
+                std::vector<uint32_t> overlay_pixels = state->pixels[idx];
+                int overlay_width = state->width;
+                int overlay_height = state->height;
+                if (!overlay_pixels.empty()) {
+                    copy_overlay_frame(&text_buf, text_w, text_h, overlay_pixels, overlay_width, overlay_height);
+                    draw_text_at(&text_buf, text_w, text_h, 22, 22, fps_text, 0xDCFFFFFF);
+                    applied_overlay_generation = overlay_generation;
                 }
             }
-#if 1
-            if (!overlay_pixels.empty() && overlay_generation != applied_overlay_generation) {
-                copy_overlay_frame(&text_buf, text_w, text_h, overlay_pixels, overlay_width, overlay_height);
-                draw_text_at(&text_buf, text_w, text_h, 22, 22, fps_text.c_str(), 0xDCFFFFFF);
-                applied_overlay_generation = overlay_generation;
-            }
-#endif
         }
 
         if (ioctl(v4l2_fd, VIDIOC_QBUF, &buf) < 0) {

@@ -1,87 +1,67 @@
 #ifndef V4L2_DRM_IMX415_AUTOFOCUS_SHARED_STATE_H
 #define V4L2_DRM_IMX415_AUTOFOCUS_SHARED_STATE_H
 
-#include <array>
-#include <atomic>
 #include <cstdint>
-#include <pthread.h>
+#include <cstring>
 
 static const int kAfRoiWidth = 320;
 static const int kAfRoiHeight = 240;
 static const int kAfLogicalMax = 64;
 
-// 视频线程与 AF 线程之间的共享区域。
-// 只共享一块中心 ROI 的 Y 分量，而不是整帧 NV12，
-// 这样拷贝量小，且 AF 线程可以只针对 Sobel 所需的数据工作。
+// 视频线程（生产者）←→ AF 线程（消费者）的共享区域。
+// 只传中心 320×240 ROI 的 Y 分量，不传整帧 NV12，减少拷贝量。
+//
+// 双缓冲无锁协议（和 overlay 一样）：
+//   roi_y[2] 两槽，视频线程写 roi_y[1 - write_idx]，写完翻转 write_idx + 置 new_frame。
+//   AF 线程轮询 new_frame，拿 roi_y[write_idx] 拷贝到本地再清 new_frame。
+//
+// restart_requested 由按键线程直接 atomic store，AF 线程下一轮查出。
+//
+// 原子操作用 GCC __atomic_* 内置函数，不用 std::atomic。
 struct AutofocusSharedState {
-    // 保护 roi_y/new_frame/restart_requested/running 等共享字段的互斥锁。
-    pthread_mutex_t mutex;
-    // 视频线程发布新 ROI 后，用它唤醒 AF 线程。
-    pthread_cond_t condition;
-    // 共享 ROI，仅保存亮度分量，适合清晰度评价。
-    std::array<uint8_t, kAfRoiWidth * kAfRoiHeight> roi_y{};
-    // new_frame = 1 表示视频线程刚发布了一块新 ROI；
-    // AF 线程复制走 ROI 后会把它清 0。
-    bool new_frame = false;
-    // restart_requested = 1 表示按键线程请求 AF 线程丢弃旧的爬山历史，
-    // 以当前镜头位置为起点，重新用初始步长开始搜索。
-    bool restart_requested = false;
-    // AF 线程总运行标志，程序退出时置 false。
-    bool running = true;
-    // 视频线程累计成功发布给 AF 的 ROI 帧数。
-    uint64_t published_frames = 0;
-    // 下面这些值主要用于观察 AF 搜索状态。
-    // 当前准备写入或刚写入的逻辑焦点位置。
-    std::atomic<int> current_focus{32};
-    // 搜索过程中记录到的最优焦点位置。
-    std::atomic<int> best_focus{32};
-    // 当前爬山搜索步长。
-    std::atomic<int> current_step{0};
-    // 最近一帧 ROI 的 Sobel 清晰度分数。
-    std::atomic<int> last_sharpness{0};
-    // 历史最优清晰度分数。
-    std::atomic<int> best_sharpness{0};
-    // 最近一次镜头移动耗时，单位微秒。
-    std::atomic<int> last_move_us{0};
-    // 当前已经连续多少帧出现清晰度下降。
-    std::atomic<int> decline_streak{0};
-    // 本轮运行中 AF 被重置重新爬山的次数。
-    std::atomic<int> restart_count{0};
+    // 双缓冲 ROI：视频线程写入 roi_y[1 - write_idx]，AF 线程读取 roi_y[write_idx]。
+    // 仅保存亮度分量，适合清晰度评价。
+    uint8_t roi_y[2][kAfRoiWidth * kAfRoiHeight];
+    int write_idx;                       // 视频线程写完后翻转
+    bool new_frame;                      // 视频线程置 true，AF 消费后清 false
+    bool restart_requested;              // 按键线程置 true，AF 查出后 exchange(false)
+    bool running;                        // 全局退出标志
+    uint64_t published_frames;           // 视频线程累计成功发布给 AF 的 ROI 帧数
+
+    // 下面都是 AF 线程写入的只读状态，别的线程随便 load 看
+    int current_focus;
+    int best_focus;
+    int current_step;
+    int last_sharpness;
+    int best_sharpness;
+    int last_move_us;
+    int decline_streak;
+    int restart_count;
 };
 
-// 功能：
-//   初始化 AF 共享状态中的 POSIX 锁与条件变量。
-// 参数：
-//   state: 待初始化的共享状态对象。
-// 返回值：
-//   true  表示初始化成功；
-//   false 表示初始化失败。
 inline bool init_autofocus_shared_state(AutofocusSharedState *state) {
     if (!state) {
         return false;
     }
-    if (pthread_mutex_init(&state->mutex, nullptr) != 0) {
-        return false;
-    }
-    if (pthread_cond_init(&state->condition, nullptr) != 0) {
-        pthread_mutex_destroy(&state->mutex);
-        return false;
-    }
+    memset(state->roi_y, 0, sizeof(state->roi_y));
+    state->write_idx = 0;
+    state->new_frame = false;
+    state->restart_requested = false;
+    state->running = true;
+    state->published_frames = 0;
+    state->current_focus = 32;
+    state->best_focus = 32;
+    state->current_step = 0;
+    state->last_sharpness = 0;
+    state->best_sharpness = 0;
+    state->last_move_us = 0;
+    state->decline_streak = 0;
+    state->restart_count = 0;
     return true;
 }
 
-// 功能：
-//   销毁 AF 共享状态中的 POSIX 锁与条件变量。
-// 参数：
-//   state: 待销毁的共享状态对象。
-// 返回值：
-//   无返回值。
 inline void destroy_autofocus_shared_state(AutofocusSharedState *state) {
-    if (!state) {
-        return;
-    }
-    pthread_cond_destroy(&state->condition);
-    pthread_mutex_destroy(&state->mutex);
+    (void)state;
 }
 
 #endif

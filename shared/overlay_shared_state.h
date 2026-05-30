@@ -1,67 +1,45 @@
 #ifndef V4L2_DRM_IMX415_OVERLAY_SHARED_STATE_H
 #define V4L2_DRM_IMX415_OVERLAY_SHARED_STATE_H
 
-#include <atomic>
 #include <cstdint>
-#include <pthread.h>
 #include <vector>
 
-// 云图线程与显示线程之间的共享区域。
-// 当前实现里，云图线程只负责生成整张 ARGB overlay，
-// 视频线程再把最新一版 overlay 拷到 DRM overlay buffer 上。
+// 音频线程（生产者）←→ 视频/推流线程（消费者）共享区域。
+// 音频线程生成 ARGB 云图，视频线程把它拷到 DRM overlay plane 上屏。
+//
+// 双缓冲无锁协议：
+//   pixels[2] 两槽，write_idx 指示当前"活跃槽"（消费者只读它）。
+//   生产者永远写 pixels[1 - write_idx]，写完再翻转 write_idx + 递增 generation。
+//   两个线程永远不会同时碰同一个槽。
+//
+// 原子操作用 GCC __atomic_* 内置函数，不用 std::atomic。
 struct OverlaySharedState {
-    // 保护 pixels/width/height/generation/ready 这些共享字段的互斥锁。
-    pthread_mutex_t mutex;
-    // 用于“尺寸已准备好”等事件通知的条件变量。
-    pthread_cond_t condition;
-    // 整张 ARGB overlay 的 CPU 像素数据。
-    std::vector<uint32_t> pixels;
-    // overlay 实际显示尺寸，和 DRM overlay plane 目标尺寸一致。
-    int width = 0;
-    int height = 0;
-    // generation 用于判断“有没有新图”，避免视频线程重复拷贝同一张 overlay。
-    uint64_t generation = 0;
-    // ready 表示 DRM 线程已经把 overlay 尺寸准备好了，云图线程可以开始出图。
-    bool ready = false;
-    // 线程总运行标志，主线程退出时会把它清为 false。
-    std::atomic<bool> running{true};
-    // 视频 plane 如果被设置了 270 度旋转，云图也要跟着同样的显示方向做坐标映射。
-    std::atomic<bool> rotate_270{false};
+    std::vector<uint32_t> pixels[2];      // 双缓冲：槽 0 / 槽 1
+    int width;                            // overlay 宽高，由显示线程初始化后只读
+    int height;
+    int write_idx;                        // 生产者写完翻转，消费者用它定位活跃槽
+    uint64_t generation;                  // 生产者每次发布 +1，消费者比对它判断有无新图
+    bool ready;                           // 显示线程设 true，音频线程轮询等它就绪
+    bool running;                         // 全局退出标志
+    bool rotate_270;                      // 视频做 270° 旋转时，云图跟着转
 };
 
-// 功能：
-//   初始化云图共享状态中的 POSIX 锁与条件变量。
-// 参数：
-//   state: 待初始化的共享状态对象。
-// 返回值：
-//   true  表示初始化成功；
-//   false 表示初始化失败。
 inline bool init_overlay_shared_state(OverlaySharedState *state) {
     if (!state) {
         return false;
     }
-    if (pthread_mutex_init(&state->mutex, nullptr) != 0) {
-        return false;
-    }
-    if (pthread_cond_init(&state->condition, nullptr) != 0) {
-        pthread_mutex_destroy(&state->mutex);
-        return false;
-    }
+    state->width = 0;
+    state->height = 0;
+    state->write_idx = 0;
+    state->generation = 0;
+    state->ready = false;
+    state->running = true;
+    state->rotate_270 = false;
     return true;
 }
 
-// 功能：
-//   销毁云图共享状态中的 POSIX 锁与条件变量。
-// 参数：
-//   state: 待销毁的共享状态对象。
-// 返回值：
-//   无返回值。
 inline void destroy_overlay_shared_state(OverlaySharedState *state) {
-    if (!state) {
-        return;
-    }
-    pthread_cond_destroy(&state->condition);
-    pthread_mutex_destroy(&state->mutex);
+    (void)state;
 }
 
 #endif

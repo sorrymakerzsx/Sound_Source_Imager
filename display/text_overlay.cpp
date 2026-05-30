@@ -6,37 +6,17 @@
 
 namespace {
 
-// 功能：
-//   计算 ARGB 缓冲区一行有多少个 32 位像素。
-// 参数：
-//   buf: 目标 dumb buffer。
-// 返回值：
-//   以像素为单位的行跨度，而不是字节数。
+// pitch 是字节跨度，这里是像素跨度
 static inline int argb_stride(const DumbBuffer *buf) {
     return static_cast<int>(buf->pitch / sizeof(uint32_t));
 }
 
-// 功能：
-//   返回指定像素位置的引用，便于直接读写 ARGB 像素。
-// 参数：
-//   buf: 目标 dumb buffer。
-//   x/y: 像素坐标。
-// 返回值：
-//   指向指定像素的引用。
 static inline uint32_t &pixel_at(DumbBuffer *buf, int x, int y) {
     return buf->pixels[y * argb_stride(buf) + x];
 }
 
 }  // namespace
 
-// 功能：
-//   用统一颜色清空一张 ARGB 图。
-// 参数：
-//   buf: 目标 dumb buffer。
-//   width/height: 有效绘制区域大小。
-//   color: ARGB8888 颜色值。
-// 返回值：
-//   无返回值。
 void clear_argb(DumbBuffer *buf, int width, int height, uint32_t color) {
     int stride = argb_stride(buf);
     for (int y = 0; y < height; ++y) {
@@ -46,16 +26,7 @@ void clear_argb(DumbBuffer *buf, int width, int height, uint32_t color) {
     }
 }
 
-// 功能：
-//   在 ARGB 图上从指定起点绘制字符串。
-// 参数：
-//   buf: 目标 dumb buffer。
-//   width/height: 有效绘制区域大小。
-//   origin_x/origin_y: 文本左上角起始位置。
-//   str: 要绘制的字符串。
-//   fg_color: 前景色，ARGB8888 格式。
-// 返回值：
-//   无返回值。
+// 用 8x8 位图字体（2x 缩放 → 16x16）在 ARGB 缓冲上渲染文本。
 void draw_text_at(DumbBuffer *buf, int width, int height, int origin_x, int origin_y,
                   const char *str, uint32_t fg_color) {
     int cursor_x = origin_x;
@@ -89,14 +60,6 @@ void draw_text_at(DumbBuffer *buf, int width, int height, int origin_x, int orig
     }
 }
 
-// 功能：
-//   以“白底黑字”的方式快速绘制一行文本。
-// 参数：
-//   buf: 目标 dumb buffer。
-//   width/height: 有效绘制区域大小。
-//   str: 要显示的字符串。
-// 返回值：
-//   无返回值。
 void draw_text(DumbBuffer *buf, int width, int height, const char *str) {
     clear_argb(buf, width, height, 0xFFFFFFFF);
     draw_text_at(buf, width, height, 10, 8, str, 0xFF000000);

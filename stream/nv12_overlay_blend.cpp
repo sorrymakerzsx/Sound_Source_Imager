@@ -4,12 +4,6 @@
 
 namespace {
 
-// 功能：
-//   把整数裁剪到 8 位无符号像素范围。
-// 参数：
-//   value: 待裁剪数值。
-// 返回值：
-//   [0, 255] 范围内的 uint8_t。
 static inline uint8_t clamp_u8(int value) {
     if (value < 0) {
         return 0;
@@ -20,47 +14,23 @@ static inline uint8_t clamp_u8(int value) {
     return static_cast<uint8_t>(value);
 }
 
-// 功能：
-//   用 alpha 把一个颜色通道混合到目标通道中。
-// 参数：
-//   dst: 目标通道原值。
-//   src: 源通道值。
-//   alpha: 源像素 alpha，范围 0~255。
-// 返回值：
-//   混合后的通道值。
+// alpha 合成一个通道：out = dst*(1-alpha) + src*alpha
 static inline uint8_t blend_channel(uint8_t dst, uint8_t src, uint8_t alpha) {
     int out = (static_cast<int>(dst) * (255 - alpha) + static_cast<int>(src) * alpha + 127) / 255;
     return clamp_u8(out);
 }
 
-// 功能：
-//   把 RGB 转换为 NV12 所需的 Y 分量。
-// 参数：
-//   r/g/b: RGB 三个通道。
-// 返回值：
-//   对应的亮度值 Y。
+// ITU-R BT.601 RGB→YCbCr 矩阵系数
 static inline uint8_t rgb_to_y(uint8_t r, uint8_t g, uint8_t b) {
     int value = (77 * r + 150 * g + 29 * b + 128) >> 8;
     return clamp_u8(value);
 }
 
-// 功能：
-//   把 RGB 转换为 NV12 所需的 U 分量。
-// 参数：
-//   r/g/b: RGB 三个通道。
-// 返回值：
-//   对应的色度 U。
 static inline uint8_t rgb_to_u(uint8_t r, uint8_t g, uint8_t b) {
     int value = ((-43 * r - 85 * g + 128 * b + 128) >> 8) + 128;
     return clamp_u8(value);
 }
 
-// 功能：
-//   把 RGB 转换为 NV12 所需的 V 分量。
-// 参数：
-//   r/g/b: RGB 三个通道。
-// 返回值：
-//   对应的色度 V。
 static inline uint8_t rgb_to_v(uint8_t r, uint8_t g, uint8_t b) {
     int value = ((128 * r - 107 * g - 21 * b + 128) >> 8) + 128;
     return clamp_u8(value);
@@ -68,17 +38,8 @@ static inline uint8_t rgb_to_v(uint8_t r, uint8_t g, uint8_t b) {
 
 }  // namespace
 
-// 功能：
-//   把一张 ARGB overlay 按 alpha 混合到 NV12 图像上。
-//   这个函数用于 stream 模式：先把云图叠到 NV12，再送给 MPP 编码。
-// 参数：
-//   nv12: 目标 NV12 帧首地址，内部包含连续的 Y 平面和 UV 平面。
-//   width/height: NV12 图像有效尺寸。
-//   stride: NV12 每行字节跨度。
-//   overlay_pixels: ARGB8888 overlay 像素数组。
-//   overlay_width/overlay_height: overlay 尺寸，必须与目标图像一致。
-// 返回值：
-//   无返回值；若输入为空或尺寸不匹配则直接返回，不做叠加。
+// 将 ARGB overlay alpha 混合到 NV12 帧，用于推流模式编码前处理。
+// NV12 的 UV 以 2x2 块为单位，对 2x2 块内像素取平均再转换。
 void blend_argb_overlay_to_nv12(uint8_t *nv12,
                                 int width,
                                 int height,
@@ -100,6 +61,7 @@ void blend_argb_overlay_to_nv12(uint8_t *nv12,
             int sum_g = 0;
             int sum_b = 0;
 
+            // Y 分量逐像素混合
             for (int dy = 0; dy < 2; ++dy) {
                 for (int dx = 0; dx < 2; ++dx) {
                     int px = x + dx;
@@ -132,6 +94,7 @@ void blend_argb_overlay_to_nv12(uint8_t *nv12,
                 continue;
             }
 
+            // UV 分量对 2x2 块取平均后混合（NV12 色度下采样）
             int samples = std::min(4, (width - x) * (height - y));
             if (samples <= 0) {
                 continue;

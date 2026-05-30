@@ -8,7 +8,6 @@
 #include <cstdio>
 #include <cstdint>
 #include <iostream>
-#include <pthread.h>
 #include <unistd.h>
 #include <vector>
 
@@ -17,52 +16,33 @@ namespace {
 static const float kPi = 3.14159265358979323846f;
 
 struct Vec2 {
-    // 阵列平面内的横向坐标。
     float x;
-    // 阵列平面内的纵向坐标。
     float y;
 };
 
 struct Vec3 {
-    // 三维空间的 X 轴分量。
     float x;
-    // 三维空间的 Y 轴分量。
     float y;
-    // 三维空间的 Z 轴分量。
     float z;
 };
 
 struct Source {
-    // 归一化图像横坐标，用于表示声源在画面中的水平位置。
-    float u;
-    // 归一化图像纵坐标，用于表示声源在画面中的垂直位置。
-    float v;
-    // 声源幅度，用于决定模拟观测信号强弱。
+    float u;       // 归一化图像横坐标
+    float v;       // 归一化图像纵坐标
     float amplitude;
 };
 
 struct Peak {
-    // 峰值在功率图或显示图中的横坐标。
     int x;
-    // 峰值在功率图或显示图中的纵坐标。
     int y;
-    // 峰值功率强度。
     float power;
 };
 
 struct PixelCoord {
-    // 显示像素横坐标。
     int x;
-    // 显示像素纵坐标。
     int y;
 };
 
-// 功能：
-//   把浮点数限制在 [0, 1] 范围内。
-// 参数：
-//   value: 原始浮点数。
-// 返回值：
-//   裁剪后的结果。
 static float clamp01(float value) {
     if (value < 0.0f) {
         return 0.0f;
@@ -73,12 +53,6 @@ static float clamp01(float value) {
     return value;
 }
 
-// 功能：
-//   把 4 个 8 位通道打包成一个 ARGB8888 像素。
-// 参数：
-//   a/r/g/b: Alpha、红、绿、蓝通道。
-// 返回值：
-//   ARGB8888 格式的 32 位像素值。
 static uint32_t make_argb(uint8_t a, uint8_t r, uint8_t g, uint8_t b) {
     return (static_cast<uint32_t>(a) << 24) |
            (static_cast<uint32_t>(r) << 16) |
@@ -86,13 +60,7 @@ static uint32_t make_argb(uint8_t a, uint8_t r, uint8_t g, uint8_t b) {
            static_cast<uint32_t>(b);
 }
 
-// 功能：
-//   按“source over”规则把一个 ARGB 像素叠加到目标像素上。
-// 参数：
-//   dst: 目标像素。
-//   src: 源像素。
-// 返回值：
-//   混合后的 ARGB8888 像素。
+// "source over" alpha 混合
 static uint32_t blend_over(uint32_t dst, uint32_t src) {
     float src_a = static_cast<float>((src >> 24) & 0xFF) / 255.0f;
     float dst_a = static_cast<float>((dst >> 24) & 0xFF) / 255.0f;
@@ -118,35 +86,15 @@ static uint32_t blend_over(uint32_t dst, uint32_t src) {
                      static_cast<uint8_t>(out_b));
 }
 
-// 功能：
-//   计算 ARGB buffer 的行跨度，单位为像素个数。
-// 参数：
-//   buf: 目标 dumb buffer。
-// 返回值：
-//   每行像素数。
 static inline int argb_stride(const DumbBuffer *buf) {
     return static_cast<int>(buf->pitch / sizeof(uint32_t));
 }
 
-// 功能：
-//   返回指定像素位置的引用，便于读写热点图像素。
-// 参数：
-//   buf: 目标 dumb buffer。
-//   x/y: 像素坐标。
-// 返回值：
-//   对应像素的引用。
 static inline uint32_t &pixel_at(DumbBuffer *buf, int x, int y) {
     return buf->pixels[y * argb_stride(buf) + x];
 }
 
-// 功能：
-//   把归一化图像坐标 (u,v) 映射到实际显示像素坐标。
-// 参数：
-//   u/v: 归一化图像坐标，范围通常在 [0,1]。
-//   width/height: 目标显示尺寸。
-//   rotate_270: 视频 plane 是否做了 270 度旋转；若为 true，需要同步修正坐标。
-// 返回值：
-//   对应的显示像素坐标。
+// 归一化图像坐标 (u, v) → 显示像素坐标，自动处理 270° 旋转
 static PixelCoord map_image_point_to_display(float u, float v, int width, int height, bool rotate_270) {
     float du = u;
     float dv = v;
@@ -162,12 +110,6 @@ static PixelCoord map_image_point_to_display(float u, float v, int width, int he
     return coord;
 }
 
-// 功能：
-//   将三维向量归一化为单位向量。
-// 参数：
-//   value: 原始三维向量。
-// 返回值：
-//   归一化后的单位向量；若输入长度过小，返回朝前的默认向量。
 static Vec3 normalize(const Vec3 &value) {
     float norm = std::sqrt(value.x * value.x + value.y * value.y + value.z * value.z);
     if (norm < 1e-6f) {
@@ -176,12 +118,7 @@ static Vec3 normalize(const Vec3 &value) {
     return {value.x / norm, value.y / norm, value.z / norm};
 }
 
-// 功能：
-//   根据图像坐标估计其在摄像头视场中的三维方向。
-// 参数：
-//   u/v: 归一化图像坐标。
-// 返回值：
-//   对应的单位方向向量。
+// 图像坐标 → 摄像头视场中的三维单位方向向量（假设 62°×39° FOV）
 static Vec3 image_to_direction(float u, float v) {
     const float h_fov = 62.0f * kPi / 180.0f;
     const float v_fov = 39.0f * kPi / 180.0f;
@@ -194,12 +131,7 @@ static Vec3 image_to_direction(float u, float v) {
     return normalize(dir);
 }
 
-// 功能：
-//   构造一个模拟的 128 阵元阿基米德螺旋麦克风阵列几何。
-// 参数：
-//   无。
-// 返回值：
-//   每个麦克风在阵列平面中的二维坐标列表。
+// 构造 128 阵元阿基米德螺旋麦克风阵列
 static std::vector<Vec2> build_archimedean_spiral_array() {
     const int mic_count = 128;
     const float max_radius = 0.095f;
@@ -216,26 +148,14 @@ static std::vector<Vec2> build_archimedean_spiral_array() {
     return positions;
 }
 
-// 功能：
-//   构造模拟声源列表。
-// 参数：
-//   无。
-// 返回值：
-//   声源列表；当前只放置一个主声源热点。
+// 模拟声源：一个主热点
 static std::vector<Source> build_sources() {
     std::vector<Source> sources;
     sources.push_back({0.63f, 0.42f, 1.0f});
     return sources;
 }
 
-// 功能：
-//   在某个频点上，生成阵列对多个声源的复数观测快拍。
-// 参数：
-//   frequency_hz: 当前模拟频点。
-//   mic_positions: 阵列几何坐标。
-//   sources: 声源列表。
-// 返回值：
-//   每个阵元在该频点上的复数观测值。
+// 在指定频点生成阵列复数观测快拍（延迟求和 beamforming 输入）
 static std::vector<std::complex<float> > build_snapshot_for_frequency(
     float frequency_hz,
     const std::vector<Vec2> &mic_positions,
@@ -262,12 +182,7 @@ static std::vector<std::complex<float> > build_snapshot_for_frequency(
     return snapshot;
 }
 
-// 功能：
-//   对整个方向网格做波束扫描，生成一张二维响应功率图。
-// 参数：
-//   无。
-// 返回值：
-//   二维功率图，数值越大表示该方向越可能存在声源。
+// 三频点波束扫描 → 96x96 归一化功率图，2 轮平滑
 static std::vector<std::vector<float> > build_power_map() {
     const int map_w = 96;
     const int map_h = 96;
@@ -333,12 +248,7 @@ static std::vector<std::vector<float> > build_power_map() {
     return smoothed;
 }
 
-// 功能：
-//   把归一化功率值映射成蓝色系 ARGB 颜色。
-// 参数：
-//   power: 归一化响应强度，范围期望在 [0,1]。
-// 返回值：
-//   对应的 ARGB8888 蓝色热点颜色。
+// 归一化功率 → 蓝色系 ARGB 热点颜色
 static uint32_t heat_color(float power) {
     float t = clamp01(power);
     float edge = std::pow(t, 1.35f);
@@ -350,12 +260,7 @@ static uint32_t heat_color(float power) {
                      static_cast<uint8_t>(180.0f + core * 75.0f));
 }
 
-// 功能：
-//   从功率图中寻找局部峰值，并按强度排序后做近邻抑制。
-// 参数：
-//   map: 二维功率图。
-// 返回值：
-//   峰值列表；当前实现只保留最强的一个主峰。
+// 局部峰值检测 → 按强度排序 → 近邻抑制（只保留最强峰）
 static std::vector<Peak> find_local_peaks(const std::vector<std::vector<float> > &map) {
     int map_h = static_cast<int>(map.size());
     int map_w = static_cast<int>(map[0].size());
@@ -406,15 +311,7 @@ static std::vector<Peak> find_local_peaks(const std::vector<std::vector<float> >
     return filtered;
 }
 
-// 功能：
-//   把功率图中的主峰渲染成一块“严格圆形边界”的稀疏蓝色热点。
-// 参数：
-//   buf: 目标 ARGB overlay buffer。
-//   width/height: overlay 尺寸。
-//   map: 二维功率图。
-//   rotate_270: 是否按旋转后的视频方向映射热点。
-// 返回值：
-//   映射到显示坐标后的主峰位置与功率；若无峰值则返回 {-1,-1,0}。
+// 在 ARGB overlay 上以主峰为中心渲染高斯衰减蓝色热点圆
 static Peak draw_sparse_response_map(DumbBuffer *buf, int width, int height,
                                      const std::vector<std::vector<float> > &map,
                                      bool rotate_270) {
@@ -491,16 +388,7 @@ static Peak draw_sparse_response_map(DumbBuffer *buf, int width, int height,
 
 }  // namespace
 
-// 功能：
-//   生成一整张声源定位 overlay：
-//   先清空背景，再计算功率图和热点，最后可选叠加 FPS 文本。
-// 参数：
-//   buf: 目标 ARGB overlay buffer。
-//   width/height: overlay 尺寸。
-//   fps: 若大于 0，则在左上角绘制 FPS 文字；若小于等于 0，则不绘制。
-//   rotate_270: 是否按视频旋转状态修正热点坐标。
-// 返回值：
-//   无返回值。
+// 生成一整张声源定位热点图 overlay
 void draw_sound_source_overlay(DumbBuffer *buf, int width, int height, float fps, bool rotate_270) {
     clear_argb(buf, width, height, 0x00000000);
 
@@ -547,30 +435,21 @@ void draw_sound_source_overlay(DumbBuffer *buf, int width, int height, float fps
     }
 }
 
-// 功能：
-//   云图线程主循环。
-//   等待显示尺寸准备好后，周期性生成一张完整 ARGB overlay，并发布给视频线程消费。
-// 参数：
-//   state: 云图共享状态，包含尺寸、像素数组、generation 和退出标志。
-// 返回值：
-//   无返回值；当 state->running 变为 false 时退出。
+// 云图线程：等显示线程告知尺寸 → 每 80ms 画一张 ARGB 热点图 → 双缓冲发布给显示/推流线程。
 void run_audio_overlay_worker(OverlaySharedState *state) {
     int overlay_width = 0;
     int overlay_height = 0;
     {
-        // 云图线程启动后先等待 DRM 线程把 overlay 尺寸准备好。
-        // 因为只有知道 LCD/overlay plane 的实际宽高后，热点坐标映射才是正确的。
-        pthread_mutex_lock(&state->mutex);
-        while (state->running.load() && !state->ready) {
-            pthread_cond_wait(&state->condition, &state->mutex);
+        // 启动阶段轮询 ready，等显示线程把 LCD 尺寸写进来
+        while (__atomic_load_n(&state->running, __ATOMIC_SEQ_CST) &&
+               !__atomic_load_n(&state->ready, __ATOMIC_SEQ_CST)) {
+            usleep(5000);
         }
-        if (!state->running.load()) {
-            pthread_mutex_unlock(&state->mutex);
+        if (!__atomic_load_n(&state->running, __ATOMIC_SEQ_CST)) {
             return;
         }
         overlay_width = state->width;
         overlay_height = state->height;
-        pthread_mutex_unlock(&state->mutex);
     }
 
     std::vector<uint32_t> local_pixels(static_cast<size_t>(overlay_width) * overlay_height, 0);
@@ -580,20 +459,16 @@ void run_audio_overlay_worker(OverlaySharedState *state) {
     local_buf.size = static_cast<uint32_t>(local_pixels.size() * sizeof(uint32_t));
     local_buf.pixels = local_pixels.data();
 
-    while (state->running.load()) {
-        bool rotate_270 = state->rotate_270.load();
-        // 在本地缓冲区里生成一张完整的 ARGB overlay。
-        // 这里不直接操作 DRM，只做“算图”。
+    while (__atomic_load_n(&state->running, __ATOMIC_SEQ_CST)) {
+        bool rotate_270 = __atomic_load_n(&state->rotate_270, __ATOMIC_SEQ_CST);
         draw_sound_source_overlay(&local_buf, overlay_width, overlay_height, -1.0f, rotate_270);
 
-        {
-            // 发布最新一版 overlay 给视频线程消费。
-            // 视频线程当前是主动轮询 generation 并 trylock 读取，
-            pthread_mutex_lock(&state->mutex);
-            state->pixels = local_pixels;
-            state->generation++;
-            pthread_mutex_unlock(&state->mutex);
-        }
+        // 双缓冲发布：画到 pixels[1 - write_idx]（非活跃槽），再翻转 write_idx + 递增 generation。
+        // 读取端（显示线程 / stream 线程）看到 generation 变了就会来拿 pixels[write_idx]。
+        int next = 1 - __atomic_load_n(&state->write_idx, __ATOMIC_ACQUIRE);
+        state->pixels[next] = local_pixels;
+        __atomic_store_n(&state->write_idx, next, __ATOMIC_RELEASE);
+        __atomic_fetch_add(&state->generation, 1, __ATOMIC_RELEASE);
 
         usleep(80000);
     }

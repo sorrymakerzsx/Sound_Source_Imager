@@ -4,32 +4,17 @@
 #include <iostream>
 #include <string>
 
-// 功能：
-//   打印命令行帮助信息。
-// 参数：
-//   program: 当前程序名，通常来自 argv[0]，用于在帮助中显示调用方式。
-// 返回值：
-//   无返回值。
 void print_usage(const char *program) {
     std::cout << "Usage: " << program
               << " [--mode drm|stream] [--proto udp|tcp] [--host ip] [--port port]"
               << std::endl;
-    std::cout << "  --mode drm       使用 DRM 在本地 LCD 上显示" << std::endl;
-    std::cout << "  --mode stream    使用 H.264 推流到 PC" << std::endl;
-    std::cout << "  --proto udp|tcp  推流协议，默认 udp" << std::endl;
-    std::cout << "  --host ip        流媒体目标主机 IP，默认 192.168.1.100" << std::endl;
-    std::cout << "  --port port      流媒体目标端口，默认 5000" << std::endl;
+    std::cout << "  --mode drm       LCD local display" << std::endl;
+    std::cout << "  --mode stream    H.264 network stream" << std::endl;
+    std::cout << "  --proto udp|tcp  stream protocol, default udp" << std::endl;
+    std::cout << "  --host ip        target IP, default 192.168.1.100" << std::endl;
+    std::cout << "  --port port      target port, default 5000" << std::endl;
 }
 
-// 功能：
-//   解析命令行参数，填充 AppConfig。
-// 参数：
-//   argc: 命令行参数个数。
-//   argv: 命令行参数数组。
-//   config: 输出参数，解析成功后写入运行模式、协议、主机和端口。
-// 返回值：
-//   true  表示参数有效，config 已可直接使用；
-//   false 表示参数非法或请求打印帮助，此时调用者应结束程序。
 bool parse_app_config(int argc, char **argv, AppConfig *config) {
     *config = AppConfig();
 

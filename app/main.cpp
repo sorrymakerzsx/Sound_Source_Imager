@@ -45,25 +45,17 @@ struct StreamThreadArg {
 //   无返回值。
 // 说明：
 //   这里只修改共享状态，不直接释放资源；真正的 join/close 由 main 统一收尾。
+// 信号处理：只改 running，线程自己轮询到就会退，不做 join / close。
 void handle_signal(int) {
     if (g_overlay_state) {
-        g_overlay_state->running.store(false);
-        pthread_cond_broadcast(&g_overlay_state->condition);
+        __atomic_store_n(&g_overlay_state->running, false, __ATOMIC_SEQ_CST);
     }
     if (g_af_state) {
-        pthread_mutex_lock(&g_af_state->mutex);
-        g_af_state->running = false;
-        pthread_mutex_unlock(&g_af_state->mutex);
-        pthread_cond_broadcast(&g_af_state->condition);
+        __atomic_store_n(&g_af_state->running, false, __ATOMIC_SEQ_CST);
     }
 }
 
-// 功能：
-//   安装 POSIX 信号处理函数。
-// 参数：
-//   无。
-// 返回值：
-//   无返回值。
+// 安装 SIGINT / SIGTERM 处理器。
 void install_signal_handlers() {
     struct sigaction sa;
     std::memset(&sa, 0, sizeof(sa));
@@ -73,82 +65,39 @@ void install_signal_handlers() {
     sigaction(SIGTERM, &sa, nullptr);
 }
 
-// 功能：
-//   pthread 音频云图线程入口。
-// 参数：
-//   arg: OverlaySharedState*。
-// 返回值：
-//   固定返回 nullptr。
 void *audio_thread_entry(void *arg) {
     run_audio_overlay_worker(reinterpret_cast<OverlaySharedState *>(arg));
     return nullptr;
 }
 
-// 功能：
-//   pthread AF 线程入口。
-// 参数：
-//   arg: AutofocusSharedState*。
-// 返回值：
-//   固定返回 nullptr。
 void *af_thread_entry(void *arg) {
     run_autofocus_worker(reinterpret_cast<AutofocusSharedState *>(arg));
     return nullptr;
 }
 
-// 功能：
-//   pthread 按键监听线程入口。
-// 参数：
-//   arg: AutofocusSharedState*。
-// 返回值：
-//   固定返回 nullptr。
 void *key_thread_entry(void *arg) {
     run_key_select_listener(reinterpret_cast<AutofocusSharedState *>(arg));
     return nullptr;
 }
 
-// 功能：
-//   pthread DRM 视频线程入口。
-// 参数：
-//   arg: DrmVideoThreadArg*。
-// 返回值：
-//   固定返回 nullptr。
+// DRM 视频线程入口。线程退出后把 running 置 false，其他线程轮询到就退。
 void *drm_video_thread_entry(void *arg) {
     DrmVideoThreadArg *ctx = reinterpret_cast<DrmVideoThreadArg *>(arg);
     *(ctx->video_result) = run_video_display_worker(ctx->shared_state, ctx->af_state);
-    ctx->shared_state->running.store(false);
-    pthread_cond_broadcast(&ctx->shared_state->condition);
-    pthread_mutex_lock(&ctx->af_state->mutex);
-    ctx->af_state->running = false;
-    pthread_mutex_unlock(&ctx->af_state->mutex);
-    pthread_cond_broadcast(&ctx->af_state->condition);
+    __atomic_store_n(&ctx->shared_state->running, false, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&ctx->af_state->running, false, __ATOMIC_SEQ_CST);
     return nullptr;
 }
 
-// 功能：
-//   pthread stream 推流线程入口。
-// 参数：
-//   arg: StreamThreadArg*。
-// 返回值：
-//   固定返回 nullptr。
+// stream 推流线程入口。退出后置 running，音频线程轮询到就退。
 void *stream_thread_entry(void *arg) {
     StreamThreadArg *ctx = reinterpret_cast<StreamThreadArg *>(arg);
     *(ctx->stream_result) = run_stream_mode(*(ctx->config), ctx->shared_state);
-    ctx->shared_state->running.store(false);
-    pthread_cond_broadcast(&ctx->shared_state->condition);
+    __atomic_store_n(&ctx->shared_state->running, false, __ATOMIC_SEQ_CST);
     return nullptr;
 }
 
-// 功能：
-//   在主线程启动工作线程之前，打印当前板子的背光与 EEPROM 外设状态。
-// 参数：
-//   无。
-// 返回值：
-//   无返回值。
-// 说明：
-//   这是“主线程调用外设封装”的入口点：
-//   1. 先调用 probe_backlight_device() 探测背光 sysfs 节点；
-//   2. 再调用 read_first_available_eeprom() 尝试读取 EEPROM 版本信息；
-//   3. 这里只做启动前状态探测和日志打印，不改变主业务线程模型。
+// 启动前探一下背光和 EEPROM，只打日志。
 void log_peripheral_state() {
     BacklightDeviceInfo backlight_info;
     if (probe_backlight_device(&backlight_info)) {
@@ -173,31 +122,19 @@ void log_peripheral_state() {
 
 }  // namespace
 
-// 功能：
-//   程序入口，根据命令行选择 DRM 本地显示模式或 stream 推流模式，
-//   并拉起对应的工作线程。
-// 参数：
-//   argc: 命令行参数个数。
-//   argv: 命令行参数数组。
-// 返回值：
-//   0  表示执行成功结束；
-//   -1 表示参数非法或初始化失败。
+// ---------------------------------------------------------------------------
+// 主入口：解析参数 → 按模式创建线程 → join 收尾
+// ---------------------------------------------------------------------------
 int main(int argc, char **argv) {
     AppConfig config;
     if (!parse_app_config(argc, argv, &config)) {
         return -1;
     }
 
-    // 主线程在创建 DRM/stream/audio/AF 工作线程之前，先探测一次外设状态。
-    // 所以如果你问“主循环里哪里调用了背光/EEPROM”，就是这里这一行。
     log_peripheral_state();
 
     if (config.mode == OutputMode::DRM) {
-        // DRM 模式下当前有四个线程：
-        // 1. 云图线程：生成声源热点 ARGB 图；
-        // 2. AF 线程：消费 ROI，做 Sobel + 爬山；
-        // 3. 按键线程：select 监听 /dev/key，触发 AF 重新爬山；
-        // 4. 视频线程：V4L2 取帧并通过 DRM 显示。
+        // 四个线程：云图 / AF / 按键 / 视频显示
         OverlaySharedState shared_state;
         AutofocusSharedState af_state;
         if (!init_overlay_shared_state(&shared_state)) {
@@ -229,8 +166,7 @@ int main(int argc, char **argv) {
         }
         if (pthread_create(&af_thread, nullptr, af_thread_entry, &af_state) != 0) {
             std::cerr << "Failed to create AF thread." << std::endl;
-            shared_state.running.store(false);
-            pthread_cond_broadcast(&shared_state.condition);
+            __atomic_store_n(&shared_state.running, false, __ATOMIC_SEQ_CST);
             pthread_join(audio_thread, nullptr);
             g_overlay_state = nullptr;
             g_af_state = nullptr;
@@ -240,12 +176,8 @@ int main(int argc, char **argv) {
         }
         if (pthread_create(&key_thread, nullptr, key_thread_entry, &af_state) != 0) {
             std::cerr << "Failed to create key thread." << std::endl;
-            shared_state.running.store(false);
-            pthread_cond_broadcast(&shared_state.condition);
-            pthread_mutex_lock(&af_state.mutex);
-            af_state.running = false;
-            pthread_mutex_unlock(&af_state.mutex);
-            pthread_cond_broadcast(&af_state.condition);
+            __atomic_store_n(&shared_state.running, false, __ATOMIC_SEQ_CST);
+            __atomic_store_n(&af_state.running, false, __ATOMIC_SEQ_CST);
             pthread_join(audio_thread, nullptr);
             pthread_join(af_thread, nullptr);
             g_overlay_state = nullptr;
@@ -258,12 +190,8 @@ int main(int argc, char **argv) {
         DrmVideoThreadArg video_arg = {&shared_state, &af_state, &video_result};
         if (pthread_create(&video_thread, nullptr, drm_video_thread_entry, &video_arg) != 0) {
             std::cerr << "Failed to create video thread." << std::endl;
-            shared_state.running.store(false);
-            pthread_cond_broadcast(&shared_state.condition);
-            pthread_mutex_lock(&af_state.mutex);
-            af_state.running = false;
-            pthread_mutex_unlock(&af_state.mutex);
-            pthread_cond_broadcast(&af_state.condition);
+            __atomic_store_n(&shared_state.running, false, __ATOMIC_SEQ_CST);
+            __atomic_store_n(&af_state.running, false, __ATOMIC_SEQ_CST);
             pthread_join(audio_thread, nullptr);
             pthread_join(af_thread, nullptr);
             pthread_join(key_thread, nullptr);
@@ -275,12 +203,8 @@ int main(int argc, char **argv) {
         }
 
         pthread_join(video_thread, nullptr);
-        shared_state.running.store(false);
-        pthread_cond_broadcast(&shared_state.condition);
-        pthread_mutex_lock(&af_state.mutex);
-        af_state.running = false;
-        pthread_mutex_unlock(&af_state.mutex);
-        pthread_cond_broadcast(&af_state.condition);
+        __atomic_store_n(&shared_state.running, false, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&af_state.running, false, __ATOMIC_SEQ_CST);
         pthread_join(audio_thread, nullptr);
         pthread_join(af_thread, nullptr);
         pthread_join(key_thread, nullptr);
@@ -314,8 +238,7 @@ int main(int argc, char **argv) {
         StreamThreadArg stream_arg = {&config, &shared_state, &stream_result};
         if (pthread_create(&stream_thread, nullptr, stream_thread_entry, &stream_arg) != 0) {
             std::cerr << "Failed to create stream thread." << std::endl;
-            shared_state.running.store(false);
-            pthread_cond_broadcast(&shared_state.condition);
+            __atomic_store_n(&shared_state.running, false, __ATOMIC_SEQ_CST);
             pthread_join(audio_thread, nullptr);
             g_overlay_state = nullptr;
             destroy_overlay_shared_state(&shared_state);
@@ -323,8 +246,7 @@ int main(int argc, char **argv) {
         }
 
         pthread_join(stream_thread, nullptr);
-        shared_state.running.store(false);
-        pthread_cond_broadcast(&shared_state.condition);
+        __atomic_store_n(&shared_state.running, false, __ATOMIC_SEQ_CST);
         pthread_join(audio_thread, nullptr);
         g_overlay_state = nullptr;
         destroy_overlay_shared_state(&shared_state);

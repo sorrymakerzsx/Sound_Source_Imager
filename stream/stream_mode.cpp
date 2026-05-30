@@ -13,7 +13,6 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
-#include <pthread.h>
 
 #include <cstring>
 #include <iostream>
@@ -28,41 +27,16 @@
 #include "rk_venc_cfg.h"
 #include "rk_venc_rc.h"
 
-// 功能：
-//   把数值按指定对齐粒度向上取整。
-// 参数：
-//   value: 原始值。
-//   alignment: 对齐粒度，通常为 2 的幂。
-// 返回值：
-//   向上对齐后的结果。
 static uint32_t align_up(uint32_t value, uint32_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
 }
 
-// 功能：
-//   通过 UDP 发送一整块 H.264 数据。
-//   为避免单个 UDP 包过大，这里会按 1400 字节左右切片发送。
-// 参数：
-//   sockfd: UDP socket。
-//   addr: 对端地址。
-//   data: 待发送数据首地址。
-//   length: 待发送总字节数。
-// 返回值：
-//   true  表示所有分片都成功发送；
-//   false 表示发送过程中出现错误或发送字节数异常。
+// UDP 分片发送，按 1400 字节切分避免 IP 分片。
 static bool send_udp_buffer(int sockfd, const struct sockaddr_in &addr, const uint8_t *data, size_t length) {
-    // 以太网 MTU 常见值是 1500 字节。扣掉 IP/UDP 头部后，单个 UDP 负载若过大，
-    // 很容易在链路层发生分片。这里主动把 H.264 数据切成约 1400 字节的小块，
-    // 目的是尽量避免 IP 分片，提高上位机接收稳定性。
     const size_t kUdpChunkSize = 1400;
 
     while (length > 0) {
         size_t chunk = length > kUdpChunkSize ? kUdpChunkSize : length;
-        // sendto:
-        //   1. sockfd 是一个 UDP socket；
-        //   2. data/chunk 指向本次要发的一个分片；
-        //   3. addr 指定目标 IP 和端口；
-        //   4. UDP 是“无连接发送”，每次 sendto 都要带上目的地址。
         ssize_t sent = sendto(sockfd, data, chunk, 0,
                               reinterpret_cast<const struct sockaddr *>(&addr), sizeof(addr));
         if (sent < 0 || static_cast<size_t>(sent) != chunk) {
@@ -75,25 +49,9 @@ static bool send_udp_buffer(int sockfd, const struct sockaddr_in &addr, const ui
     return true;
 }
 
-// 功能：
-//   通过 TCP 发送一整块数据，直到全部发送完成。
-// 参数：
-//   sockfd: 已连接的 TCP socket。
-//   data: 待发送数据首地址。
-//   length: 待发送总字节数。
-// 返回值：
-//   true  表示全部字节写出成功；
-//   false 表示 send 失败或连接中断。
+// TCP 阻塞发送，循环直到全部写完。MSG_NOSIGNAL 避免对端断开时触发 SIGPIPE。
 static bool send_tcp_all(int sockfd, const uint8_t *data, size_t length) {
     while (length > 0) {
-        // send:
-        //   用于已建立连接的 TCP socket。
-        // TCP 是字节流协议，一次 send 不保证把 length 个字节全部发完，
-        // 所以这里必须循环调用 send，直到剩余字节数变为 0。
-        //
-        // MSG_NOSIGNAL:
-        //   当对端异常断开时，禁止内核给本进程发送 SIGPIPE。
-        //   这样应用层能通过 send 返回值判断错误，而不会被信号直接打断退出。
         ssize_t sent = send(sockfd, data, length, MSG_NOSIGNAL);
         if (sent <= 0) {
             return false;
@@ -104,15 +62,7 @@ static bool send_tcp_all(int sockfd, const uint8_t *data, size_t length) {
     return true;
 }
 
-// 功能：
-//   运行 stream 模式主流程：
-//   V4L2 采集 NV12 -> 可选叠加 ARGB 云图 -> MPP 编码 H.264 -> UDP/TCP 发到上位机。
-// 参数：
-//   config: 应用层运行配置，包含协议、目标主机、端口等。
-//   state: 云图共享状态；若非空，则在编码前把最新 overlay 混合进 NV12 帧。
-// 返回值：
-//   0  表示正常结束；
-//   -1 表示初始化、采集、编码或网络发送过程中出现错误。
+// Stream 模式：V4L2 采集 → 可选云图叠加 → MPP H.264 编码 → UDP/TCP 推流。
 int run_stream_mode(const AppConfig &config, OverlaySharedState *state) {
     std::cout << "Selected mode: stream" << std::endl;
     std::cout << "Streaming H.264 to " << config.host << ":" << config.port << std::endl;
@@ -160,6 +110,7 @@ int run_stream_mode(const AppConfig &config, OverlaySharedState *state) {
         close(v4l2_fd);
     };
 
+    // ---- V4L2 采集初始化 ----
     struct v4l2_format fmt;
     std::memset(&fmt, 0, sizeof(fmt));
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -182,16 +133,12 @@ int run_stream_mode(const AppConfig &config, OverlaySharedState *state) {
     size_t raw_frame_bytes = static_cast<size_t>(hor_stride) * kFrameHeight * 3 / 2;
     size_t enc_frame_bytes = static_cast<size_t>(hor_stride) * ver_stride * 3 / 2;
 
+    // 通知云图线程 overlay 尺寸
     if (state) {
-        pthread_mutex_lock(&state->mutex);
         state->width = kFrameWidth;
         state->height = kFrameHeight;
-        state->ready = true;
-        state->rotate_270.store(false);
-        pthread_mutex_unlock(&state->mutex);
-    }
-    if (state) {
-        pthread_cond_broadcast(&state->condition);
+        __atomic_store_n(&state->rotate_270, false, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&state->ready, true, __ATOMIC_RELEASE);
     }
 
     struct v4l2_requestbuffers req;
@@ -239,18 +186,11 @@ int run_stream_mode(const AppConfig &config, OverlaySharedState *state) {
         }
     }
 
+    // ---- 网络 socket ----
     struct sockaddr_in peer_addr;
     std::memset(&peer_addr, 0, sizeof(peer_addr));
-    // sockaddr_in 用来描述 IPv4 对端地址。
-    // 这里统一填好目标主机和端口，后续 UDP 的 sendto 或 TCP 的 connect/bind 都会复用它。
     peer_addr.sin_family = AF_INET;
-    // htons:
-    //   端口号在网络上传输时要求网络字节序（大端），
-    //   所以要把主机字节序的 config.port 转成网络字节序。
     peer_addr.sin_port = htons(config.port);
-    // inet_pton:
-    //   把 "192.168.x.x" 这样的点分十进制字符串转成二进制 IPv4 地址。
-    //   如果返回值不是 1，说明用户输入的目标 IP 非法。
     if (inet_pton(AF_INET, config.host.c_str(), &peer_addr.sin_addr) != 1) {
         std::cerr << "Invalid target IP: " << config.host << std::endl;
         cleanup();
@@ -258,10 +198,6 @@ int run_stream_mode(const AppConfig &config, OverlaySharedState *state) {
     }
 
     if (config.proto == StreamProto::UDP) {
-        // socket(AF_INET, SOCK_DGRAM, 0):
-        //   创建一个 IPv4 UDP socket。
-        //   数据传输类型为SOCK_DGRAM报文式传输，对应UDP
-        //   UDP 不需要像 TCP 那样先建立连接，后面直接 sendto 即可发包。
         net_fd = socket(AF_INET, SOCK_DGRAM, 0);
         if (net_fd < 0) {
             std::cerr << "Failed to create UDP socket" << std::endl;
@@ -269,10 +205,6 @@ int run_stream_mode(const AppConfig &config, OverlaySharedState *state) {
             return -1;
         }
     } else if (config.proto == StreamProto::TCP) {
-        // socket(AF_INET, SOCK_STREAM, 0):
-        //   创建一个 IPv4 TCP socket。
-        //   数据传输类型为SOCK_STREAM字节流式传输，对应TCP
-        //   TCP 是面向连接的协议，后面必须经过 connect 或 listen/accept 才能真正收发数据。
         net_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (net_fd < 0) {
             std::cerr << "Failed to create TCP socket" << std::endl;
@@ -281,52 +213,34 @@ int run_stream_mode(const AppConfig &config, OverlaySharedState *state) {
         }
 
         int one = 1;
-        // TCP_NODELAY:
-        //   关闭 Nagle 算法，尽量让编码器产出的包立刻发出去，
-        //   降低小包在发送端聚合等待的时延，更适合低延迟视频预览场景。
         setsockopt(net_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
         if (config.host == "0.0.0.0") {
+            // 作为 TCP server：bind + listen + accept
             int opt = 1;
-            // SO_REUSEADDR:
-            //   允许端口快速复用，避免程序刚退出时端口仍处于 TIME_WAIT，
-            //   导致重新启动监听失败。
             setsockopt(net_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-            // bind:
-            //   把本地监听 socket 绑定到指定端口上。
-            //   这里 host=0.0.0.0 表示“本机作为 TCP 服务端”，等待上位机主动连过来。
             if (bind(net_fd, reinterpret_cast<const struct sockaddr *>(&peer_addr), sizeof(peer_addr)) < 0) {
                 std::cerr << "Failed to bind TCP port " << config.port << std::endl;
                 cleanup();
                 return -1;
             }
-            // listen:
-            //   把普通 TCP socket 变成监听 socket，backlog=1 表示这里只接受一个上位机连接。
             if (listen(net_fd, 1) < 0) {
                 std::cerr << "Failed to listen TCP" << std::endl;
                 cleanup();
                 return -1;
             }
             std::cout << "Waiting for TCP connection on port " << config.port << "..." << std::endl;
-            // accept:
-            //   阻塞等待客户端接入。
-            //   成功后会返回一个新的已连接 socket(client_fd)，
-            //   原 net_fd 仍然只是“监听 socket”。
             int client_fd = accept(net_fd, NULL, NULL);
             if (client_fd < 0) {
                 std::cerr << "Failed to accept TCP connection" << std::endl;
                 cleanup();
                 return -1;
             }
-            // 监听 socket 只负责握手，真正传输视频时只需要已连接的 client_fd。
             close(net_fd);
             net_fd = client_fd;
-            // 对真正的传输 socket 再设置一次 TCP_NODELAY，确保低延迟策略生效在连接通道上。
             setsockopt(net_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         } else {
-            // connect:
-            //   当前板卡作为 TCP 客户端，主动连接到上位机监听端口。
-            //   connect 成功后，后续就可以对 net_fd 直接调用 send 发送 H.264 码流。
+            // 作为 TCP client：connect
             if (connect(net_fd, reinterpret_cast<const struct sockaddr *>(&peer_addr), sizeof(peer_addr)) != 0) {
                 std::cerr << "Failed to connect TCP to " << config.host << ":" << config.port << std::endl;
                 cleanup();
@@ -339,6 +253,7 @@ int run_stream_mode(const AppConfig &config, OverlaySharedState *state) {
         return -1;
     }
 
+    // ---- MPP H.264 编码器初始化 ----
     MPP_RET ret = mpp_create(&mpp_ctx, &mpp_mpi);
     if (ret != MPP_OK) {
         std::cerr << "mpp_create failed: " << ret << std::endl;
@@ -409,6 +324,7 @@ int run_stream_mode(const AppConfig &config, OverlaySharedState *state) {
         return -1;
     }
 
+    // 发送 H.264 SPS/PPS 头
     MppPacket header_packet = NULL;
     if (mpp_packet_init_with_buffer(&header_packet, header_buf) == MPP_OK) {
         mpp_packet_set_length(header_packet, 0);
@@ -416,8 +332,6 @@ int run_stream_mode(const AppConfig &config, OverlaySharedState *state) {
             void *header_ptr = mpp_packet_get_pos(header_packet);
             size_t header_len = mpp_packet_get_length(header_packet);
             if (header_ptr && header_len > 0) {
-                // 编码器初始化后先发一份 SPS/PPS 头。
-                // 对端 ffplay/ffmpeg 只有拿到这份 AVC 头信息，才能正确解析后续裸 H.264 码流。
                 bool header_ok = false;
                 if (config.proto == StreamProto::UDP) {
                     header_ok = send_udp_buffer(net_fd, peer_addr,
@@ -453,21 +367,18 @@ int run_stream_mode(const AppConfig &config, OverlaySharedState *state) {
                   << config.port << "?listen" << std::endl;
     }
 
+    // ---- 推流主循环 ----
     bool logged_first_packet = false;
     uint64_t applied_overlay_generation = 0;
     std::vector<uint32_t> overlay_pixels;
     int overlay_width = 0;
     int overlay_height = 0;
 
-    while (!state || state->running.load()) {
+    while (!state || __atomic_load_n(&state->running, __ATOMIC_SEQ_CST)) {
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(v4l2_fd, &fds);
         struct timeval tv = {2, 0};
-        // select:
-        //   等待 V4L2 设备变为“可读”，本质上就是等待采集驱动准备好一帧。
-        //   这里不是网络 select，而是对视频采集 fd 做 I/O 多路复用等待，
-        //   避免线程在没有新帧时忙轮询占满 CPU。
         int ready = select(v4l2_fd + 1, &fds, NULL, NULL, &tv);
         if (ready <= 0) {
             std::cerr << "Select timeout or error in stream mode" << std::endl;
@@ -496,19 +407,16 @@ int run_stream_mode(const AppConfig &config, OverlaySharedState *state) {
         std::memset(dst_ptr, 0, enc_frame_bytes);
         std::memcpy(dst_ptr, stream_buffers[buf.index].start, raw_frame_bytes);
 
+        // overlay 的读取和 drm_mode 一样：generation 变 → 有新图 → 从活跃槽拷贝。
+        // 音频线程同时在写 pixels[1 - write_idx]，不冲突。
         if (state) {
-            uint64_t overlay_generation = 0;
-            {
-                if (pthread_mutex_trylock(&state->mutex) == 0) {
-                    overlay_generation = state->generation;
-                    if (overlay_generation != applied_overlay_generation && !state->pixels.empty()) {
-                        overlay_pixels = state->pixels;
-                        overlay_width = state->width;
-                        overlay_height = state->height;
-                        applied_overlay_generation = overlay_generation;
-                    }
-                    pthread_mutex_unlock(&state->mutex);
-                }
+            uint64_t overlay_generation = __atomic_load_n(&state->generation, __ATOMIC_ACQUIRE);
+            if (overlay_generation != applied_overlay_generation) {
+                int idx = __atomic_load_n(&state->write_idx, __ATOMIC_ACQUIRE);
+                overlay_pixels = state->pixels[idx];
+                overlay_width = state->width;
+                overlay_height = state->height;
+                applied_overlay_generation = overlay_generation;
             }
 
             if (!overlay_pixels.empty()) {
@@ -543,7 +451,6 @@ int run_stream_mode(const AppConfig &config, OverlaySharedState *state) {
             break;
         }
 
-        // 这里按“一帧取一次输出包”的方式处理，避免首帧后整个推流线程停在编码器上。
         MppPacket packet = NULL;
         ret = mpp_mpi->encode_get_packet(mpp_ctx, &packet);
         if (ret != MPP_OK) {
@@ -555,9 +462,6 @@ int run_stream_mode(const AppConfig &config, OverlaySharedState *state) {
             void *packet_ptr = mpp_packet_get_pos(packet);
             size_t packet_len = mpp_packet_get_length(packet);
             if (packet_ptr && packet_len > 0) {
-                // 编码器每产出一个 H.264 NALU/码流包，就立刻按协议发给上位机：
-                //   UDP: sendto 分片发送；
-                //   TCP: send 循环发送直到当前包完全写出。
                 bool ok = false;
                 if (config.proto == StreamProto::UDP) {
                     ok = send_udp_buffer(net_fd, peer_addr,
