@@ -96,15 +96,15 @@ static void publish_af_roi_if_possible(AutofocusSharedState *af_state,
     }
 
     const int next = 1 - __atomic_load_n(&af_state->write_idx, __ATOMIC_ACQUIRE);
-    const uint8_t *src_y = reinterpret_cast<const uint8_t *>(buffer.start);
-    const int roi_x = static_cast<int>((kFrameWidth - kAfRoiWidth) / 2);
-    const int roi_y_off = static_cast<int>((kFrameHeight - kAfRoiHeight) / 2);
+    const uint8_t *src_y = reinterpret_cast<const uint8_t *>(buffer.start);     //y分量首地址
+    const int roi_x = static_cast<int>((kFrameWidth - kAfRoiWidth) / 2);        //中心 ROI 的 X 起点
+    const int roi_y_off = static_cast<int>((kFrameHeight - kAfRoiHeight) / 2);  //中心ROI的Y起点
     for (int y = 0; y < kAfRoiHeight; ++y) {
         std::memcpy(&af_state->roi_y[next][y * kAfRoiWidth],
                     src_y + (roi_y_off + y) * pitch + roi_x,
                     kAfRoiWidth);
     }
-    __atomic_store_n(&af_state->write_idx, next, __ATOMIC_RELEASE);
+    __atomic_store_n(&af_state->write_idx, next, __ATOMIC_RELEASE);     //翻转 write_idx，让 AF 线程知道新数据来了
     __atomic_store_n(&af_state->new_frame, true, __ATOMIC_RELEASE);
     __atomic_fetch_add(&af_state->published_frames, 1, __ATOMIC_RELAXED);
 }
@@ -136,7 +136,7 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
         return -1;
     }
 
-    uint32_t af_pitch = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
+    uint32_t af_pitch = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;   //获取每行字节数（pitch），用于 AF ROI 计算
     if (af_pitch == 0) {
         af_pitch = kFrameWidth;
     }
@@ -356,15 +356,16 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
         close(v4l2_fd);
         return -1;
     }
-
-    std::vector<Buffer> buffers(kBufferCount);
+    //初始化进程中的缓存区
+    std::vector<Buffer> buffers(kBufferCount);      //数量4
     for (uint32_t i = 0; i < kBufferCount; i++) {
-        struct v4l2_plane planes[1];
-        struct v4l2_buffer buf;
+        //===========遍历 4 个缓冲区，逐个初始化。===========
+        struct v4l2_plane planes[1];    //单平面数组（虽然 NV12 逻辑上有 Y 和 UV 两个平面，但这里用的是 multi-planar API，plane 0 代表整个缓冲区）
+        struct v4l2_buffer buf;         //V4L2 缓冲区描述结构，用于 ioctl 与内核通信
         std::memset(&buf, 0, sizeof(buf));
         std::memset(planes, 0, sizeof(planes));
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        buf.memory = V4L2_MEMORY_MMAP;
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;  //视频捕获，多平面 API（mplane）
+        buf.memory = V4L2_MEMORY_MMAP;  //MMAP映射方式
         buf.index = i;
         buf.m.planes = planes;
         buf.length = 1;
@@ -378,7 +379,6 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
             close(v4l2_fd);
             return -1;
         }
-
         // CPU 侧 mmap，供 AF ROI 读取
         buffers[i].length = buf.m.planes[0].length;
         buffers[i].start = mmap(NULL, buffers[i].length, PROT_READ | PROT_WRITE,
@@ -413,7 +413,7 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
         buffers[i].v4l2_fd = expbuf.fd;
 
         // 导入 DRM → GEM handle → framebuffer（NV12 双平面）
-        if (drmPrimeFDToHandle(drm_fd, buffers[i].v4l2_fd, &buffers[i].drm_handle) < 0) {
+        if (drmPrimeFDToHandle(drm_fd, buffers[i].v4l2_fd, &buffers[i].drm_handle) < 0) {   //把DMA-BUF描述符转换成DRM内部的GEN handle（整数句柄）
             std::cerr << "Failed to import DMA-BUF to DRM" << std::endl;
             drmModeFreeEncoder(enc);
             drmModeFreeConnector(conn);
@@ -422,7 +422,7 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
             close(v4l2_fd);
             return -1;
         }
-
+        //用导入的GEM handle创建DRM framebuffer对象，指定格式为NV12。DRM会把这个framebuffer和之前导入的GEM handle关联起来，后续显示时直接用这个framebuffer ID即可。
         uint32_t handles[4] = {buffers[i].drm_handle, buffers[i].drm_handle, 0, 0};
         uint32_t pitches[4] = {af_pitch, af_pitch, 0, 0};
         uint32_t offsets[4] = {0, af_pitch * kFrameHeight, 0, 0};
@@ -475,7 +475,7 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
         FD_ZERO(&fds);
         FD_SET(v4l2_fd, &fds);
         struct timeval tv = {2, 0};
-        int r = select(v4l2_fd + 1, &fds, NULL, NULL, &tv);
+        int r = select(v4l2_fd + 1, &fds, NULL, NULL, &tv); //等待 V4L2 采集到一帧数据，超时为 2 秒
         if (r <= 0) {
             std::cerr << "Select timeout or error" << std::endl;
             break;
@@ -613,7 +613,7 @@ int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af
                 std::vector<uint32_t> overlay_pixels = state->pixels[idx];
                 int overlay_width = state->width;
                 int overlay_height = state->height;
-                if (!overlay_pixels.empty()) {
+                if (!overlay_pixels.empty()) {  //防止从还没初始化过的槽里拿空数据去渲染
                     copy_overlay_frame(&text_buf, text_w, text_h, overlay_pixels, overlay_width, overlay_height);
                     draw_text_at(&text_buf, text_w, text_h, 22, 22, fps_text, 0xDCFFFFFF);
                     applied_overlay_generation = overlay_generation;

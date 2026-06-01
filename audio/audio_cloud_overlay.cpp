@@ -440,7 +440,7 @@ void run_audio_overlay_worker(OverlaySharedState *state) {
     int overlay_width = 0;
     int overlay_height = 0;
     {
-        // 启动阶段轮询 ready，等显示线程把 LCD 尺寸写进来
+        // 启动阶段轮询 5ms周期轮询ready，等显示线程把 LCD 尺寸写进来
         while (__atomic_load_n(&state->running, __ATOMIC_SEQ_CST) &&
                !__atomic_load_n(&state->ready, __ATOMIC_SEQ_CST)) {
             usleep(5000);
@@ -460,7 +460,7 @@ void run_audio_overlay_worker(OverlaySharedState *state) {
     local_buf.pixels = local_pixels.data();
 
     while (__atomic_load_n(&state->running, __ATOMIC_SEQ_CST)) {
-        bool rotate_270 = __atomic_load_n(&state->rotate_270, __ATOMIC_SEQ_CST);
+        bool rotate_270 = __atomic_load_n(&state->rotate_270, __ATOMIC_SEQ_CST);    //云图是否旋转
         draw_sound_source_overlay(&local_buf, overlay_width, overlay_height, -1.0f, rotate_270);
 
         // 双缓冲发布：画到 pixels[1 - write_idx]（非活跃槽），再翻转 write_idx + 递增 generation。
@@ -469,7 +469,5 @@ void run_audio_overlay_worker(OverlaySharedState *state) {
         state->pixels[next] = local_pixels;
         __atomic_store_n(&state->write_idx, next, __ATOMIC_RELEASE);
         __atomic_fetch_add(&state->generation, 1, __ATOMIC_RELEASE);
-
-        usleep(80000);
     }
 }

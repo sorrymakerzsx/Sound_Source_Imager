@@ -17,4 +17,5 @@ struct AutofocusSharedState;
 //   -1 表示初始化或显示过程中出现错误。
 int run_video_display_worker(OverlaySharedState *state, AutofocusSharedState *af_state);
 
+
 #endif
